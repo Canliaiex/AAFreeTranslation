@@ -18,11 +18,13 @@ Double-click `run.bat` to launch the PowerShell translation backend.
 
 ### 2. Install the Addon
 
-Copy the `AAFreeTranslation` folder to the game's Addons directory, then enable it in the game's addon management.
+Place the `AAFreeTranslation` folder into `Documents\AAFreeTo\Addon\`, then add a line `AAFreeTranslation` to the `addons.txt` file.
 
 ### 3. In-Game Configuration
 
-Avoid editing files manually. Use the in-game settings window to configure the addon:
+Open the settings menu in the bottom-right corner → **ADDON**, click the refresh icon in the bottom-right of the ADDON window to load the addon, select this addon from the list, then click the Settings button on the right to configure.
+
+Avoid editing files manually. Use the settings window described above to configure the addon:
 
 | Item | Description |
 |------|------------|
