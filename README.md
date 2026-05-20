@@ -6,6 +6,8 @@
 
 上古世纪聊天翻译插件（支持中文、英文、俄文三种语言互译）。需要配合 PowerShell 翻译服务一起使用。
 
+> **运行环境要求：Windows PowerShell 5.1**（系统自带，无需额外安装）。
+
 ## 使用方法
 
 ### 1. 启动翻译服务
@@ -54,11 +56,12 @@
 ## 注意事项
 
 - 当前已知测试过的模型：`glm-4-flash`、`deepseek-v4-flash`
-- 如果使用其他模型且该模型带有"思考"（Reasoning/Thinking）功能，需在 `monitor_translation_v2.ps1` 的 `Invoke-ChatAPI` 函数中（约第 508 行）添加禁用思考的代码，参考已有写法：
+- 如果使用其他模型且该模型带有"思考"（Reasoning/Thinking）功能，需在 `monitor_translation_v2.ps1` 的 `Invoke-ChatAPI` 函数中添加禁用思考的代码，参考已有写法：
 
-```powershell
-# 关闭模型的思考功能，以 deepseek 为例
-if ($model -like '*deepseek*') { $body.thinking = @{ type = "disabled" } }
+```csharp
+// 禁用 deepseek 模型的思考功能（代码已内置，如需自定义可参考）
+if (model != null && model.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0)
+    body["thinking"] = new Hashtable { { "type", "disabled" } };
 ```
 
 ---

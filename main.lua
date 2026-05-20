@@ -123,7 +123,7 @@ local function writeChatToTranslatingFile(channel, unit, isHostile, name, messag
 		--if tostring(channel) == "3" then return end--屏蔽频道
 		--if tostring(channel) ~= "0" then return end--屏蔽其他频道进行测试
 		if name == playerName then return end--屏蔽自己发送
-		api.File:Write(chatSourceFile, tostring( "||||" .. channel .. "||||" .. name .. "||||" .. message .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||"))
+		api.File:Write(chatSourceFile, tostring( "||||" .. channel .. "||||" .. name .. "||||" .. base64Encode(message) .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||"))
 	end
 end
 
@@ -206,7 +206,7 @@ local function trSendRequest(text,KeyState)
 	if KeyState then
 		IsSendInputMsg = true
 	end
-	api.File:Write(InRequestFile, tostring("||||" .. translateType .. "||||" .. playerName .. "||||" .. text .. "||||" .. trRequestTimestamp .. "||||"))
+	api.File:Write(InRequestFile, tostring("||||" .. translateType .. "||||" .. playerName .. "||||" .. base64Encode(text) .. "||||" .. trRequestTimestamp .. "||||"))
 
 
 end
@@ -231,7 +231,7 @@ local function trReadResponseRaw()
 			api.File:Write(sendResultFile, tostring("||||" .. info[2] .. "||||" .. tostring(InputBoxState) .. "||||" .. settingsPage.GetLang() .. "||||" .. info[4] .. "||||"))
 
 		end
-		api.File:Write(OutResponseFile, "")--情况1：翻译结果已写入文件，清空文件内容
+		--api.File:Write(OutResponseFile, "")--情况1：翻译结果已写入文件，清空文件内容
 		return true
 	end
 	return nil

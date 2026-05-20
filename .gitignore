@@ -1,0 +1,10 @@
+*
+!/ai_prompts.json
+!/main.lua
+!/monitor_translation_v2.ps1
+!/README.en.md
+!/README.md
+!/README.ru.md
+!/run.bat
+!/settings_page.lua
+!/.gitignore

@@ -14,47 +14,12 @@
 param ()
 
 # 单实例检测（在 try 内创建，确保 finally 能清理）
-$mutexName = "Global\AAFreeTranslation_Monitor_v2"
 
 # 初始化
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName "System.Web"
 Add-Type -AssemblyName "System.Web.Extensions"
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-Add-Type -Name Win32 -Namespace Native -MemberDefinition @'
-[DllImport("user32.dll")]
-public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")]
-public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
-[DllImport("user32.dll")]
-public static extern uint GetClassName(IntPtr hWnd, System.Text.StringBuilder className, int count);
-[DllImport("user32.dll")]
-public static extern IntPtr SendMessageA(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-[DllImport("user32.dll")]
-public static extern bool OpenClipboard(IntPtr hWndNewOwner);
-[DllImport("user32.dll")]
-public static extern bool EmptyClipboard();
-[DllImport("user32.dll")]
-public static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
-[DllImport("user32.dll")]
-public static extern bool CloseClipboard();
-[DllImport("kernel32.dll")]
-public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
-[DllImport("kernel32.dll")]
-public static extern IntPtr GlobalLock(IntPtr hMem);
-[DllImport("kernel32.dll")]
-public static extern bool GlobalUnlock(IntPtr hMem);
-[DllImport("kernel32.dll")]
-public static extern IntPtr GlobalFree(IntPtr hMem);
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern IntPtr GetCurrentProcess();
-[DllImport("advapi32.dll", SetLastError=true)]
-public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-[DllImport("advapi32.dll", SetLastError=true)]
-public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
-[DllImport("kernel32.dll", SetLastError=true)]
-public static extern void CloseHandle(IntPtr hObject);
-'@ -ErrorAction SilentlyContinue
 
 $trayFormsPath = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Windows.Forms' } | ForEach-Object { $_.Location } | Where-Object { $_ -and $_ -ne '' } | Select-Object -First 1
 $trayDrawingPath = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Drawing' } | ForEach-Object { $_.Location } | Where-Object { $_ -and $_ -ne '' } | Select-Object -First 1
@@ -63,10 +28,26 @@ if (-not $trayDrawingPath) {
     $trayDrawingPath = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Drawing' } | ForEach-Object { $_.Location } | Where-Object { $_ -and $_ -ne '' } | Select-Object -First 1
 }
 
-Add-Type -ReferencedAssemblies $trayFormsPath,$trayDrawingPath -TypeDefinition @'
+# 加载 System.Net.Http（C# Workers 需要）
+Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+$__asmWebEx = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Web.Extensions' } | ForEach-Object { $_.Location } | Select-Object -First 1
+$__asmNetHttp = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'System.Net.Http' } | ForEach-Object { $_.Location } | Select-Object -First 1
+
+# ============================================================
+# C# 子线程：文件监控 + 手动Worker + 自动Worker
+# ============================================================
+Add-Type -ReferencedAssemblies $__asmWebEx,$__asmNetHttp,$trayFormsPath,$trayDrawingPath -TypeDefinition @'
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
+using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 
 public static class TrayManager
@@ -86,7 +67,7 @@ public static class TrayManager
     private static NotifyIcon _notifyIcon;
     private static ContextMenu _contextMenu;
     private static IntPtr _hWnd;
-    private static Timer _pollTimer;
+    private static System.Windows.Forms.Timer _pollTimer;
     private static bool _initialized = false;
 
     public static void Initialize()
@@ -97,9 +78,9 @@ public static class TrayManager
         _hWnd = GetConsoleWindow();
         if (_hWnd == IntPtr.Zero) return;
 
-        System.Threading.Thread staThread = new System.Threading.Thread(StaWorker);
+        Thread staThread = new Thread(StaWorker);
         staThread.IsBackground = true;
-        staThread.SetApartmentState(System.Threading.ApartmentState.STA);
+        staThread.SetApartmentState(ApartmentState.STA);
         staThread.Start();
     }
 
@@ -136,7 +117,7 @@ public static class TrayManager
         });
         _notifyIcon.ContextMenu = _contextMenu;
 
-        _pollTimer = new Timer();
+        _pollTimer = new System.Windows.Forms.Timer();
         _pollTimer.Interval = 200;
         _pollTimer.Tick += (s, e) =>
         {
@@ -171,995 +152,1238 @@ public static class TrayManager
         }
     }
 }
-'@ -ErrorAction SilentlyContinue
 
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
+public static class CSharpWorkers
+{
+    // ========== 线程管理 ==========
+    private static volatile bool _running;
+    private static Thread _fileWatcherThread;
+    private static Thread _manualWorkerThread;
+    private static Thread _mainThread;
+    private static readonly Thread[] _autoWorkerThreads = new Thread[3];
+    private static readonly HttpClient _http = new HttpClient();
+    private static readonly Hashtable _fileWriteLocks = new Hashtable();
+    private static readonly Hashtable _fileLastWrites = new Hashtable();
+    private static readonly object _fileLockRoot = new object();
 
-# 全局配置
-[string]$AutoFilePath         = ".\cache\chat_source"
-[string]$RequestFilePath      = ".\cache\manual_request"
-[string]$ManualOutFile        = ".\cache\manual_response"
-[string]$AutoOutFile           = ".\cache\chat_result"
-[string]$ConfigFile           = ".\config.ini"
-[string]$PromptFile           = ".\ai_prompts.json"
-[string]$SendResultFile        = ".\cache\send_result"
-[int]$MaxConcurrentThreads    = 4
-[int]$CacheMaxSize            = 100
-[int]$HttpTimeoutSec          = 60
-[int]$RetryIntervalSec        = 5
-mode con: cols=100 lines=30
-# 从 config.ini 读取 AI 配置（Lua 表格式，区分 input/output）
-# config.ini 在 $sync 初始化后通过 Read-Config 加载
-
-# 从 ai_prompts.json 读取提示词配置
-$AiPrompts = $null
-try {
-    $rawJson = [System.IO.File]::ReadAllText($PromptFile, [System.Text.UTF8Encoding]::new($false))
-    $jss = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
-    $jss.MaxJsonLength = [int]::MaxValue
-    $AiPrompts = $jss.DeserializeObject($rawJson)
-    [System.Console]::WriteLine("[ConFig] Loaded Done $PromptFile")
-} catch {
-    [System.Console]::WriteLine("[ConFig] ReadFile: $PromptFile Error: $_")
-}
-if (-not $AiPrompts) {
-    [System.Console]::WriteLine("[ConFig] $PromptFile Prompt not loaded. Using default prompt.")
-}
-
-# ============================================================
-# 管理员权限检测
-# ============================================================
-function Test-Admin {
-    $hToken = [IntPtr]::Zero
-    try {
-        if (-not [Native.Win32]::OpenProcessToken([Native.Win32]::GetCurrentProcess(),0x0008,[ref] $hToken)) {return $false}
-        $pElevation = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(4)
-        try {
-            $returnLength = 0
-            if (-not [Native.Win32]::GetTokenInformation($hToken,20,$pElevation,4,[ref] $returnLength)) {return $false}
-            $elevated = [System.Runtime.InteropServices.Marshal]::ReadInt32($pElevation) -ne 0
-            return $elevated
-        } finally {
-            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pElevation)
+    public static void StartAll(Hashtable sync)
+    {
+        // 单实例 Mutex
+        try
+        {
+            bool createdNew;
+            var mutex = new Mutex(false, "Global\\AAFreeTranslation_Monitor_v2", out createdNew);
+            if (!createdNew)
+            {
+                Console.Error.WriteLine("[Error] Another instance is already running!");
+                Environment.Exit(1);
+            }
+            sync["AppMutex"] = mutex;
         }
-    } finally {
-        if ($hToken -ne [IntPtr]::Zero) {
-            [Native.Win32]::CloseHandle($hToken)
+        catch (AbandonedMutexException ex)
+        {
+            sync["AppMutex"] = ex.Mutex;
+            Console.WriteLine("[Warning] Previous instance was terminated abnormally, taking over.");
+        }
+
+        // Admin 检测 + 窗口标题
+        bool isAdmin = TestAdmin();
+        sync["IsAdmin"] = isAdmin;
+        Console.Title = isAdmin ? "[Admin] AAFreeTranslation" : "[User] AAFreeTranslation";
+
+        // 托盘图标
+        try { TrayManager.Initialize(); } catch { }
+
+        // 启动信息
+        Console.WriteLine("");
+        Console.WriteLine("=== Running ===");
+        Console.WriteLine("Auto messages: {0}", sync["AutoFilePath"]);
+        Console.WriteLine("Manual requests: {0}", sync["RequestFilePath"]);
+        Console.WriteLine("Input model (manual): {0}", sync["InputModel"]);
+        Console.WriteLine("Input endpoint: {0}", sync["InputEndpoint"]);
+        Console.WriteLine("Output model (auto): {0}", sync["OutputModel"]);
+        Console.WriteLine("Output endpoint: {0}", sync["OutputEndpoint"]);
+        Console.WriteLine("Max concurrency: {0} threads", sync["MaxConcurrent"]);
+        Console.WriteLine("Cache limit: {0} entries", sync["CacheMaxSize"]);
+        Console.WriteLine("{0}", isAdmin ? "[Main] Send Enabled" : "[Main] Send Disabled");
+        Console.WriteLine("");
+
+        // 启动子线程
+        _running = true;
+
+        _fileWatcherThread = new Thread(FileWatcherProc) { IsBackground = true };
+        _fileWatcherThread.Start(sync);
+
+        _manualWorkerThread = new Thread(ManualWorkerProc) { IsBackground = true };
+        _manualWorkerThread.Start(sync);
+
+        for (int i = 0; i < 3; i++)
+        {
+            int id = i + 1;
+            _autoWorkerThreads[i] = new Thread(AutoWorkerProc) { IsBackground = true };
+            _autoWorkerThreads[i].Start(new object[] { sync, id });
+        }
+
+        _mainThread = new Thread(MainProc) { IsBackground = true };
+        _mainThread.Start(sync);
+
+        Console.WriteLine("[Start] All C# workers running");
+    }
+
+    public static void StopAll()
+    {
+        _running = false;
+    }
+
+    public static void CleanupAll(Hashtable sync)
+    {
+        Console.WriteLine("\n[Cleanup] Stopping...");
+        sync["StopFlag"] = true;
+        _running = false;
+
+        // TrayManager 清理
+        try { TrayManager.Cleanup(); } catch { }
+
+        // Mutex 释放
+        try { var m = (Mutex)sync["AppMutex"]; if (m != null) m.Dispose(); } catch { }
+
+        // 统计
+        Console.WriteLine("");
+        Console.WriteLine("=== Statistics ===");
+        Console.WriteLine("Auto messages found: {0}", sync["AutoFound"]);
+        Console.WriteLine("Cache hits:          {0}", sync["AutoCached"]);
+        Console.WriteLine("Auto translations succeeded: {0}", sync["AutoSent"]);
+        Console.WriteLine("Auto skipped (no translation needed): {0}", sync["AutoSkipped"]);
+        Console.WriteLine("Manual translations succeeded: {0}", sync["ManualSent"]);
+        Console.WriteLine("Translation failures: {0}", sync["Failed"]);
+        Console.WriteLine("[Cleanup] Complete");
+    }
+
+    private static bool ShouldStop(Hashtable sync)
+    {
+        if (!_running) return true;
+        try { return (bool)sync["StopFlag"]; } catch { return true; }
+    }
+
+    // ========== 文件操作 ==========
+    private static void WriteFileLocked(string path, string content)
+    {
+        object fileLock;
+        lock (_fileLockRoot)
+        {
+            fileLock = _fileWriteLocks[path];
+            if (fileLock == null)
+            {
+                fileLock = new object();
+                _fileWriteLocks[path] = fileLock;
+            }
+        }
+        lock (fileLock)
+        {
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                byte[] data = Encoding.UTF8.GetBytes(content);
+                fs.Write(data, 0, data.Length);
+            }
         }
     }
-}
 
-# ============================================================
-# 发送内容函数
-# ============================================================
-function Send-ToGame {
-    param([string]$sendData)
-    try {
-        [System.Console]::WriteLine("[SendToGame] Enter")
-        #if (-not $sync.IsAdmin) { return }
-        [System.Console]::WriteLine($data)
-        # $sendData 已经是文件内容，不需要再读文件
-        $data = $sendData
-        if ([string]::IsNullOrEmpty($data)) { return }
-
-        # 解析字段
-        $fields = $data -split '\|\|\|\|'
-        $sendContent = if ($fields.Count -ge 2) { $fields[1] } else { "" }
-        $inputBoxState = if ($fields.Count -ge 3) { $fields[2] -eq "1" } else { $false }
-        $targetLang = if ($fields.Count -ge 4) { $fields[3] } else { "" }
-
-        # 时间戳验证（13位时间戳，取前10位秒数与当前时间比较，超过3秒则丢弃）
-        $timestampField = if ($fields.Count -ge 5) { $fields[4] } else { "" }
-        if (-not [string]::IsNullOrEmpty($timestampField) -and $timestampField.Length -ge 10) {
-            $tsSec = [long]$timestampField.Substring(0, 10)
-            $nowSec = [DateTimeOffset]::Now.ToUnixTimeSeconds()
-            [System.Console]::WriteLine("[SendToGame] TimeDiff: {0}s" -f ($nowSec - $tsSec))
-            if ([Math]::Abs($nowSec - $tsSec) -gt 3) { 
-                [System.Console]::WriteLine("[SendToGame] TimeOut 3s")
-                return 
+    private static void WriteChatResultLocked(string path, string content)
+    {
+        object fileLock;
+        lock (_fileLockRoot)
+        {
+            fileLock = _fileWriteLocks[path];
+            if (fileLock == null)
+            {
+                fileLock = new object();
+                _fileWriteLocks[path] = fileLock;
             }
-
         }
+        lock (fileLock)
+        {
+            int waitMs = 0;
+            lock (_fileLockRoot)
+            {
+                object last = _fileLastWrites[path];
+                if (last != null)
+                    waitMs = 100 - (int)(DateTime.Now - (DateTime)last).TotalMilliseconds;
+            }
+            if (waitMs > 0) Thread.Sleep(waitMs);
 
-        # Base64 解码
-        $sendText = ""
-        if (-not [string]::IsNullOrEmpty($sendContent)) {
-            try {
-                $sendBytes = [Convert]::FromBase64String($sendContent)
-                $sendText = [System.Text.Encoding]::UTF8.GetString($sendBytes)
-            } catch { return }
-        } else { return }
-        [System.Console]::WriteLine("[SendToGame] SendText: $sendText")
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                byte[] data = Encoding.UTF8.GetBytes(content);
+                fs.Write(data, 0, data.Length);
+            }
+            lock (_fileLockRoot)
+            {
+                _fileLastWrites[path] = DateTime.Now;
+            }
+        }
+    }
 
-        # 根据语言判断是否需要发送原文（翻译不完整时）
-        # $targetLang 可能为 zh、en、ru
-        # 这里先留空，用户补充逻辑
+    private static string ReadLuaFile(string path)
+    {
+        try
+        {
+            string raw = File.ReadAllText(path, Encoding.UTF8).Trim().Trim('"');
+            if (string.IsNullOrEmpty(raw)) return "";
+            // 如果包含 {chatMsg = "..."} 格式，提取内部内容
+            var m = Regex.Match(raw, @"\{chatMsg\s*=\s*""(.*)""\}", RegexOptions.Singleline);
+            if (m.Success) raw = m.Groups[1].Value.Trim();
+            if (!raw.StartsWith("||||") || !raw.EndsWith("||||")) return "";
+            string[] parts = raw.Split(new[] { "||||" }, StringSplitOptions.None);
+            if (parts.Length < 6) return "";
+            return raw;
+        }
+        catch { return ""; }
+    }
 
-        # 获取前台窗口
-        $hwnd = [Native.Win32]::GetForegroundWindow()
-        $sbTitle = [System.Text.StringBuilder]::new(256)
-        $sbClass = [System.Text.StringBuilder]::new(256)
-        [Native.Win32]::GetWindowText($hwnd, $sbTitle, 256) | Out-Null
-        [Native.Win32]::GetClassName($hwnd, $sbClass, 256) | Out-Null
-        $fgTitle = $sbTitle.ToString()
-        $fgClass = $sbClass.ToString()
+    // ========== 缓存管理 ==========
+    private static string GetCache(Hashtable cache, string key)
+    {
+        if (string.IsNullOrEmpty(key)) return null;
+        lock (cache.SyncRoot)
+        {
+            if (cache.ContainsKey(key))
+            {
+                var entry = (Hashtable)cache[key];
+                entry["hitCount"] = (int)entry["hitCount"] + 1;
+                entry["lastHit"] = DateTime.Now;
+                return (string)entry["translation"];
+            }
+        }
+        return null;
+    }
 
-        if ($fgClass -ne "ArcheAge" -or $fgTitle -notmatch "ArcheAge") { return }
-
-        # 放入剪贴板（带重试，防止瞬间被占用）
-        $bytes = [System.Text.Encoding]::Unicode.GetBytes($sendText + "`0")
-        $hMem = [Native.Win32]::GlobalAlloc(0x0042, [UIntPtr]::new($bytes.Length))
-        if ($hMem -eq [IntPtr]::Zero) { return }
-        try {
-            $pMem = [Native.Win32]::GlobalLock($hMem)
-            if ($pMem -eq [IntPtr]::Zero) { return }
-            [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $pMem, $bytes.Length)
-            [Native.Win32]::GlobalUnlock($hMem) | Out-Null
-
-            $clipOpen = $false
-            for ($retry = 0; $retry -lt 10; $retry++) {
-                if ([Native.Win32]::OpenClipboard([IntPtr]::Zero)) {
-                    $clipOpen = $true
-                    break
+    private static void SetCache(Hashtable cache, int maxSize, string key, string translation)
+    {
+        if (string.IsNullOrEmpty(key)) return;
+        lock (cache.SyncRoot)
+        {
+            if (cache.Count >= maxSize)
+            {
+                string newestKey = null;
+                string secondNewestKey = null;
+                int newestHitCount = 0;
+                DateTime newestTime = DateTime.MinValue;
+                DateTime secondNewestTime = DateTime.MinValue;
+                foreach (DictionaryEntry kv in cache)
+                {
+                    var ent = (Hashtable)kv.Value;
+                    DateTime t = (DateTime)ent["lastHit"];
+                    if (t > newestTime)
+                    {
+                        secondNewestKey = newestKey;
+                        secondNewestTime = newestTime;
+                        newestKey = (string)kv.Key;
+                        newestHitCount = (int)ent["hitCount"];
+                        newestTime = t;
+                    }
+                    else if (t > secondNewestTime)
+                    {
+                        secondNewestKey = (string)kv.Key;
+                        secondNewestTime = t;
+                    }
                 }
-                [System.Threading.Thread]::Sleep(50)
+                if (newestHitCount >= 3 && cache.Count > 1 && secondNewestKey != null)
+                    cache.Remove(secondNewestKey);
+                else if (newestKey != null)
+                    cache.Remove(newestKey);
             }
-            if (-not $clipOpen) { return }
+            var entry = new Hashtable();
+            entry["hitCount"] = 0;
+            entry["lastHit"] = DateTime.Now;
+            entry["translation"] = translation;
+            cache[key] = entry;
+        }
+    }
 
-            [Native.Win32]::EmptyClipboard() | Out-Null
-            [Native.Win32]::SetClipboardData(13, $hMem) | Out-Null
-            [Native.Win32]::CloseClipboard() | Out-Null
-        } finally {
-            # 如果剪贴板打开失败，hMem 需要释放
-            if (-not $clipOpen) {
-                [Native.Win32]::GlobalFree($hMem) | Out-Null
+    // ========== 语言检测 ==========
+    private static bool NeedTranslate(string text, string targetLang)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(targetLang)) return false;
+        text = text.Replace("@^", "").Replace("@&", "");
+        if (text.Trim() == "") return false;
+        bool hasLetter = false;
+        foreach (char c in text)
+        {
+            if (char.IsLetter(c)) { hasLetter = true; break; }
+        }
+        if (!hasLetter) return false;
+        int charCount = 0, enCount = 0, zhCount = 0, ruCount = 0;
+        foreach (char c in text)
+        {
+            int code = (int)c;
+            if      (code >= 0x4E00 && code <= 0x9FFF) { zhCount++; charCount++; }
+            else if (code >= 0x3400 && code <= 0x4DBF) { zhCount++; charCount++; }
+            else if (code >= 0x0400 && code <= 0x04FF) { ruCount++; charCount++; }
+            else if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) { enCount++; charCount++; }
+        }
+        if (charCount == 0) return false;
+        string detectedLang = "en";
+        int maxCount = enCount;
+        if (zhCount >= maxCount) { maxCount = zhCount; detectedLang = "zh"; }
+        if (ruCount >= maxCount) { maxCount = ruCount; detectedLang = "ru"; }
+        return detectedLang != targetLang;
+    }
+
+    // ========== Google 翻译 ==========
+    public static string InvokeGoogleTranslate(int timeoutSec, string targetLang, string text)
+    {
+        try
+        {
+            string url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
+                + targetLang + "&dt=t&q=" + Uri.EscapeDataString(text);
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Timeout = timeoutSec * 1000;
+            req.Method = "GET";
+            using (var resp = req.GetResponse())
+            using (var reader = new StreamReader(resp.GetResponseStream()))
+            {
+                string json = reader.ReadToEnd();
+                var match = Regex.Match(json, @"\[\[\[""([^""]*)""");
+                if (match.Success) return match.Groups[1].Value;
             }
-            # 注意：如果 SetClipboardData 成功，剪贴板接管了 hMem，不能再释放
+            return "";
         }
-        $WM_ACTIVATE = 0x0006
-        $WM_KEYDOWN  = 0x0100
-        $WM_KEYUP    = 0x0101
-        $VK_RETURN   = 0x0D
-        $VK_CONTROL  = 0x11
-        $VK_V        = 0x56
-        $VK_SHIFT    = 0x10
-        [System.Threading.Thread]::Sleep(50)
-        [System.Console]::WriteLine("[SendToGame] TO Game")
-        # 激活窗口
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_ACTIVATE, [IntPtr]::Zero, [IntPtr]::Zero)
-        # 放开 Shift 键
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP, [IntPtr]$VK_SHIFT, [IntPtr]::Zero)
-        # 如果编辑框已开启，先关再开
-        if ($inputBoxState) {
-            $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYDOWN, [IntPtr]$VK_RETURN, [IntPtr]::Zero)
-            $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP,   [IntPtr]$VK_RETURN, [IntPtr]::Zero)
-            [System.Threading.Thread]::Sleep(100)
+        catch (System.Net.WebException)
+        {
+            Console.WriteLine("[Google:Error] Connection timeout (" + timeoutSec + "s)");
+            return null;
         }
-        [System.Threading.Thread]::Sleep(50)
-        
-        # 回车（打开聊天框）
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYDOWN, [IntPtr]$VK_RETURN, [IntPtr]::Zero)
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP,   [IntPtr]$VK_RETURN, [IntPtr]::Zero)
-
-        [System.Threading.Thread]::Sleep(80)
-
-        # 安全释放 V 键
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP,   [IntPtr]$VK_V, [IntPtr]::Zero)
-        # Ctrl + V：Ctrl 按下 → V 按下 → V 释放 → Ctrl 释放
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYDOWN, [IntPtr]$VK_CONTROL, [IntPtr]::Zero)
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYDOWN, [IntPtr]$VK_V, [IntPtr]::Zero)
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP,   [IntPtr]$VK_V, [IntPtr]::Zero)
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP,   [IntPtr]$VK_CONTROL, [IntPtr]::Zero)
-
-        [System.Threading.Thread]::Sleep(50)
-
-        # 回车（发送）
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYDOWN, [IntPtr]$VK_RETURN, [IntPtr]::Zero)
-        $null = [Native.Win32]::SendMessageA($hwnd, $WM_KEYUP,   [IntPtr]$VK_RETURN, [IntPtr]::Zero)
-        [System.Console]::WriteLine("[SendToGame] END")
-    } catch { $null = $_ }
-}
-
-# ============================================================
-# 翻译工具函数 (from google_translate.ps1)
-# ============================================================
-
-function NeedTranslate {
-    param ([string]$text, [string]$lang)
-    $cleanText = $text -replace '@\^', ''
-    if ($cleanText.Trim() -eq "") { return $false }
-    if ($cleanText -match '^[0-9\s\p{P}\p{S}]+$') { return $false }
-    $charCount = 0
-    $langCounts = @{ en = 0; zh = 0; ru = 0 }
-    foreach ($c in $cleanText.ToCharArray()) {
-        $code = [int]$c
-        if      ($code -ge 0x4E00 -and $code -le 0x9FFF) { $langCounts.zh++; $charCount++ }
-        elseif  ($code -ge 0x0400 -and $code -le 0x04FF) { $langCounts.ru++; $charCount++ }
-        elseif (($code -ge 0x41 -and $code -le 0x5A) -or ($code -ge 0x61 -and $code -le 0x7A)) { $langCounts.en++; $charCount++ }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[Google:Error] " + ex.Message);
+            return null;
+        }
     }
-    if ($charCount -eq 0) { return $false }
-    $detectedLang = $null; $maxCount = -1
-    foreach ($entry in $langCounts.GetEnumerator()) {
-        if ($entry.Value -gt $maxCount) { $maxCount = $entry.Value; $detectedLang = $entry.Key }
-    }
-    return $detectedLang -ne $lang
-}
 
-function GetItemLinkCount {
-    param ([ref]$text, [string]$replaceWith, [ref]$replacedItems, [string]$pattern)
-    $matchResults = [regex]::Matches($text.Value, $pattern)
-    if ($PSBoundParameters.ContainsKey('replacedItems')) {
-        $replacedItems.Value = @()
-        foreach ($m in $matchResults) { $replacedItems.Value += $m.Value }
+    private static Hashtable AsHashtable(object obj)
+    {
+        var ht = obj as Hashtable;
+        if (ht != null) return ht;
+        var dict = obj as Dictionary<string, object>;
+        if (dict != null)
+        {
+            ht = new Hashtable();
+            foreach (var kv in dict) ht[kv.Key] = kv.Value;
+            return ht;
+        }
+        return null;
     }
-    if ($PSBoundParameters.ContainsKey('replaceWith')) {
-        $text.Value = [regex]::Replace($text.Value, $pattern, $replaceWith)
+
+    private static ArrayList AsArrayList(object obj)
+    {
+        var list = obj as ArrayList;
+        if (list != null) return list;
+        var arr = obj as object[];
+        if (arr != null) return new ArrayList(arr);
+        return null;
     }
-    return $matchResults.Count
-}
-# ============================================================
-# 缓存辅助函数
-# ============================================================
-function Add-ToCache {
-    param ([hashtable]$cache, [string]$key, [string]$translation, [int]$maxSize)
-    if ($cache.ContainsKey($key)) { return }
-    if ($cache.Count -ge $maxSize) {
-        $newestKey = $null; $newestHitCount = 0; $newestTime = [DateTime]::MinValue
-        $secondNewestKey = $null; $secondNewestTime = [DateTime]::MinValue
-        foreach ($entry in $cache.GetEnumerator()) {
-            $t = $entry.Value.lastHit
-            if ($t -gt $newestTime) {
-                $secondNewestKey = $newestKey; $secondNewestTime = $newestTime
-                $newestKey = $entry.Key; $newestHitCount = $entry.Value.hitCount; $newestTime = $t
-            } elseif ($t -gt $secondNewestTime) {
-                $secondNewestKey = $entry.Key; $secondNewestTime = $t
+
+    // ========== ChatAPI 翻译 ==========
+    public static string InvokeChatAPI(int timeoutSec, string endpoint, string apiKey, string model, ArrayList messages, Hashtable config)
+    {
+        try
+        {
+            var jss = new System.Web.Script.Serialization.JavaScriptSerializer();
+            jss.MaxJsonLength = int.MaxValue;
+            var body = new Hashtable();
+            body["model"] = model;
+            body["messages"] = messages;
+            if (model != null && model.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0)
+                body["thinking"] = new Hashtable { { "type", "disabled" } };
+            if (config != null)
+            {
+                if (config.Contains("temperature")) body["temperature"] = config["temperature"];
+                if (config.Contains("top_p")) body["top_p"] = config["top_p"];
+                if (config.Contains("max_tokens")) body["max_tokens"] = config["max_tokens"];
             }
-        }
-        if ($newestHitCount -ge 3 -and $cache.Count -gt 1) {
-            $cache.Remove($secondNewestKey)
-        } else {
-            $cache.Remove($newestKey)
-        }
-    }
-    $cache[$key] = @{
-        translation = $translation
-        hitCount    = 0
-        lastHit     = [DateTime]::Now
-    }
-}
-
-# ============================================================
-# 共享数据
-# ============================================================
-$sync = [Hashtable]::Synchronized(@{})
-$sync.StopFlag           = $false
-$sync.NewAutoMessage     = $null       # 文件线程 → 主线程：新的自动消息
-$sync.NewAutoReady       = $false      # 自动消息信号
-# $sync.ActiveThreadCount 已废弃（改用固定 3+1 工作线程）
-$sync.PendingMessages    = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-$sync.StatusMessages     = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())  # Runspace → 主线程 状态消息
-$sync.Cache              = [Hashtable]::Synchronized(@{})  # 翻译缓存
-$sync.CacheMaxSize       = $CacheMaxSize
-$sync.AutoWorkQueue      = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())   # 自动翻译工作队列
-$sync.ManualWorkQueue    = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())   # 手动翻译工作队列
-
-$sync.AutoFilePath     = $AutoFilePath
-$sync.RequestFilePath  = $RequestFilePath
-$sync.ManualOutFile = $ManualOutFile
-
-$sync.HttpTimeoutSec  = $HttpTimeoutSec
-$sync.RetryIntervalSec = $RetryIntervalSec
-$sync.MaxConcurrent   = $MaxConcurrentThreads
-$sync.AiPrompts       = $AiPrompts
-$sync.AutoOutFile     = [System.IO.Path]::GetFullPath($AutoOutFile)
-$sync.ConfigFilePath  = [System.IO.Path]::GetFullPath($ConfigFile)
-$sync.SendResultFile = [System.IO.Path]::GetFullPath($SendResultFile)
-$sync.SendToGame     = ${function:Send-ToGame}
-$sync.SendToGameReady = $false
-$sync.SendResultContent = $null
-
-function Read-Config {
-    param([hashtable]$sync)
-    try {
-        $cfg = @{}
-    $raw = [System.IO.File]::ReadAllText($sync.ConfigFilePath, [System.Text.UTF8Encoding]::new($false))
-    if ($raw) {
-        $matchedItems = [regex]::Matches($raw, '(\w+)\s*=\s*"?([^",}\s]+)"?')
-        foreach ($m in $matchedItems) {
-            $cfg[$m.Groups[1].Value] = $m.Groups[2].Value
-        }
-    }
-        if ($cfg['inputBaseURL'])   { $sync.InputEndpoint = $cfg['inputBaseURL'] }
-        if ($cfg['inputApiKey'])    { $sync.InputApiKey   = $cfg['inputApiKey'] }
-        if ($cfg['inputModelName']) { $sync.InputModel    = $cfg['inputModelName'].ToLower() }
-        if ($cfg['outputBaseURL'])  { $sync.OutputEndpoint = $cfg['outputBaseURL'] }
-        if ($cfg['outputApiKey'])   { $sync.OutputApiKey   = $cfg['outputApiKey'] }
-        if ($cfg['outputModelName']){ $sync.OutputModel    = $cfg['outputModelName'].ToLower() }
-        if ($cfg['translateEngine']){ $sync.TranslateEngine = [int]$cfg['translateEngine'] }
-        $sync.StatusMessages.Enqueue("[Config] Reloaded Config.ini")
-    } catch {
-        $sync.StatusMessages.Enqueue("[Config] Error: $_")
-    }
-}
-$sync.ReadConfig = ${function:Read-Config}
-
-# 加载配置（不校验 key，客户端后续更新）
-Read-Config -sync $sync
-
-# 统计
-$sync.AutoFound   = 0
-$sync.AutoCached  = 0
-$sync.AutoSent    = 0
-$sync.ManualSent  = 0
-$sync.AutoSkipped = 0
-$sync.Failed      = 0
-
-# 共享函数
-$sync.NeedTranslate = ${function:NeedTranslate}
-
-function Invoke-ChatAPI {
-    param($sync, $endpoint, $apiKey, $model, $messages, $config)
-    $body = @{ model = $model; messages = $messages }
-    if ($config) {
-        if ($config.temperature) { $body.temperature = $config.temperature }
-        if ($config.top_p)       { $body.top_p = $config.top_p }
-        if ($config.max_tokens)  { $body.max_tokens = $config.max_tokens }
-    }
-    if ($model -like '*deepseek*') { $body.thinking = @{ type = "disabled" } }
-    $jss = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
-    $jss.MaxJsonLength = [int]::MaxValue
-    $jsonBody = $jss.Serialize($body)
-    $utf8Body = [System.Text.Encoding]::UTF8.GetBytes($jsonBody)
-    try {
-        $req = [System.Net.WebRequest]::Create($endpoint)
-        $req.Method = "POST"
-        $req.ContentType = "application/json; charset=utf-8"
-        $req.Headers.Add("Authorization", "Bearer $apiKey")
-        $req.Timeout = $sync.HttpTimeoutSec * 1000
-        $reqStream = $req.GetRequestStream()
-        $reqStream.Write($utf8Body, 0, $utf8Body.Length)
-        $reqStream.Dispose()
-        $resp = $req.GetResponse()
-        $reader = [System.IO.StreamReader]::new($resp.GetResponseStream())
-        $jsonResult = $reader.ReadToEnd()
-        $reader.Dispose()
-        $resp.Dispose()
-        $deserialized = $jss.DeserializeObject($jsonResult)
-        $text = $deserialized['choices'][0]['message']['content']
-        return ($text.Trim() -replace '^\[|\]$', '')
-    } catch { 
-        [System.Console]::WriteLine("[ChatAPI:Error] $_")
-        return $null 
-    }
-}
-$sync.InvokeChatAPI = ${function:Invoke-ChatAPI}
-
-function Invoke-GoogleTranslate {
-    param($sync, [string]$targetLang, [string]$text)
-    try {
-        $uri = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=$targetLang&dt=t&q=$([System.Web.HttpUtility]::UrlEncode($text))"
-        $req = [System.Net.WebRequest]::Create($uri)
-        $req.Timeout = 5000
-        $req.Method = "GET"
-        $resp = $req.GetResponse()
-        $reader = [System.IO.StreamReader]::new($resp.GetResponseStream())
-        $json = $reader.ReadToEnd()
-        $reader.Dispose()
-        $resp.Dispose()
-        if ($json -match '\[\[\["([^"]*)"' -and $Matches[1]) { return $Matches[1] }
-        return ""
-    } catch [System.Net.WebException] {
-        try { $sync.StatusMessages.Enqueue("[Google:Error] Connection timeout (5s)") } catch { $null = $_ }
-        return $null
-    } catch {
-        try { $sync.StatusMessages.Enqueue(("[Google:Error] $_")) } catch { $null = $_ }
-        return $null
-    }
-}
-$sync.InvokeGoogleTranslate = ${function:Invoke-GoogleTranslate}
-
-# ============================================================
-# 手动翻译工作线程代码（1 个常驻 Runspace，从 ManualWorkQueue 取消息）
-# ============================================================
-$manualWorkerCode = {
-    param($sync)
-
-    while (-not $sync.StopFlag) {
-        $content = $null
-        [System.Threading.Monitor]::Enter($sync.ManualWorkQueue.SyncRoot)
-        try {
-            if ($sync.ManualWorkQueue.Count -gt 0) {
-                $content = $sync.ManualWorkQueue.Dequeue()
-            }
-        } finally {
-            [System.Threading.Monitor]::Exit($sync.ManualWorkQueue.SyncRoot)
-        }
-        if ($null -eq $content) {
-            [System.Threading.Thread]::Sleep(100)
-            continue
-        }
-
-        try {
-        # 解析手动请求内容
-        $fields = $content -split '\|\|\|\|'
-        $translateType = ""
-        $playerName = ""
-        $msgText = $content
-        $timestamp = ""
-        if ($fields.Count -ge 5) {
-            $translateType = $fields[1]
-            $playerName    = $fields[2]
-            $msgText       = $fields[3]
-            $timestamp     = $fields[4]
-        }
-        if ($msgText.Trim() -eq "") { continue }
-
-        if ($translateType -eq "0" -or [int]$translateType -gt 6) {
-            try {
-                $errB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("[Error]"))
-                $output = '{chatMsg = "||||' + $playerName + '||||' + $errB64 + '||||' + $timestamp + '||||"}'
-                [System.IO.File]::WriteAllText($sync.ManualOutFile, $output, [System.Text.UTF8Encoding]::new($false))
-            } catch { $null = $_ }
-            continue
-        }
-
-        if ($sync.TranslateEngine -eq 2 -and -not $sync.InputApiKey) {
-            $sync.StatusMessages.Enqueue("[Input:Error] No API Key configured")
-            continue
-        }
-
-        $manualTargetLang = switch ([int]$translateType) {
-            1 { "en" }
-            2 { "ru" }
-            3 { "zh" }
-            4 { "ru" }
-            5 { "zh" }
-            6 { "en" }
-            default { "en" }
-        }
-
-        # 翻译逻辑（原 Invoke-ManualRequest 内部 scriptblock）
-        $manualCfg = $sync.AiPrompts.manual
-        $typeCfg = $null
-        if ($manualCfg.by_type) { $typeCfg = $manualCfg.by_type.$translateType }
-        $systemMsg = "You are a translator. Translate the following text to $manualTargetLang. Only return the translated text, nothing else, no explanations."
-        if ($typeCfg) { $systemMsg = $typeCfg.system_prompt }
-
-        $msgs = @()
-        $msgs += @{ role = "system"; content = $systemMsg }
-        if ($manualCfg.examples) {
-            foreach ($ex in $manualCfg.examples) {
-                $msgs += @{ role = "user";      content = $ex.user }
-                $msgs += @{ role = "assistant"; content = $ex.assistant }
+            string jsonBody = jss.Serialize(body);
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(endpoint);
+            req.Method = "POST";
+            req.ContentType = "application/json; charset=utf-8";
+            req.Headers.Add("Authorization", "Bearer " + apiKey);
+            req.Timeout = timeoutSec * 1000;
+            byte[] payload = Encoding.UTF8.GetBytes(jsonBody);
+            using (var stream = req.GetRequestStream()) { stream.Write(payload, 0, payload.Length); }
+            using (var resp = req.GetResponse())
+            using (var reader = new StreamReader(resp.GetResponseStream()))
+            {
+                string result = reader.ReadToEnd();
+                var obj = AsHashtable(jss.DeserializeObject(result));
+                if (obj == null) return "";
+                var choices = AsArrayList(obj["choices"]);
+                if (choices == null || choices.Count == 0) return "";
+                var first = AsHashtable(choices[0]);
+                if (first == null) return "";
+                var msg = AsHashtable(first["message"]);
+                if (msg == null) return "";
+                string text = msg["content"] as string;
+                if (text == null) return "";
+                return text.Trim().TrimStart('[').TrimEnd(']');
             }
         }
-        $wrapped = $msgText
-        if ($manualCfg.wrap) { $wrapped = $manualCfg.wrap -replace '{text}', $msgText }
-        $msgs += @{ role = "user"; content = $wrapped }
-
-        if ($sync.TranslateEngine -eq 1) {
-            $result = & $sync.InvokeGoogleTranslate -sync $sync -targetLang $manualTargetLang -text $msgText
-        } elseif ($sync.TranslateEngine -eq 2) {
-            $config = @{}
-            if ($manualCfg.temperature) { $config.temperature = $manualCfg.temperature }
-            if ($manualCfg.top_p)       { $config.top_p = $manualCfg.top_p }
-            if ($manualCfg.max_tokens)  { $config.max_tokens = $manualCfg.max_tokens }
-            $result = & $sync.InvokeChatAPI -sync $sync -endpoint $sync.InputEndpoint -apiKey $sync.InputApiKey -model $sync.InputModel -messages $msgs -config $config
-        }
-
-        if ($null -ne $result -and $result -ne "") {
-            try {
-                $utf8Bytes = [System.Text.Encoding]::UTF8.GetBytes($result)
-                $b64 = [Convert]::ToBase64String($utf8Bytes)
-                $origBytes = [System.Text.Encoding]::UTF8.GetBytes($msgText)
-                $origB64 = [Convert]::ToBase64String($origBytes)
-                $output = '{chatMsg = "||||' + $playerName + '||||' + $b64 + '||||' + $origB64 + '||||' + $timestamp + '||||"}'
-                [System.IO.File]::WriteAllText($sync.ManualOutFile, $output, [System.Text.UTF8Encoding]::new($false))
-            } catch { $null = $_ }
-            $sync.ManualSent++
-            $sync.StatusMessages.Enqueue(("[Input:Done] {0}" -f $result.Substring(0, [Math]::Min(50, $result.Length))))
-        } else {
-            try {
-                $errB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("[Error]"))
-                $output = '{chatMsg = "||||' + $playerName + '||||' + $errB64 + '||||' + $timestamp + '||||"}'
-                [System.IO.File]::WriteAllText($sync.ManualOutFile, $output, [System.Text.UTF8Encoding]::new($false))
-            } catch { $null = $_ }
-            $sync.Failed++
-            $sync.StatusMessages.Enqueue("[Input:Error]")
-        }
-        } catch {
-            $sync.Failed++
-            $sync.StatusMessages.Enqueue(("[Input:Error] $_"))
+        catch (Exception ex)
+        {
+            Console.WriteLine("[ChatAPI:Error] " + ex.Message);
+            return null;
         }
     }
-}
 
-# ============================================================
-# Ctrl+C 直接退出
-# ============================================================
+    // ========== 文件监控线程 ==========
+    private static void FileWatcherProc(object state)
+    {
+        var sync = (Hashtable)state;
+        var manualQ = (Queue)sync["ManualWorkQueue"];
+        string lastManual = ReadLuaFile((string)sync["RequestFilePath"]);
+        string lastAuto = ReadLuaFile((string)sync["AutoFilePath"]);
+        string lastSend = ReadLuaFile((string)sync["SendResultFile"]);
+        DateTime lastSendTime = DateTime.MinValue;
+        DateTime lastConfigTime = DateTime.MinValue;
+        try { lastConfigTime = File.GetLastWriteTime((string)sync["ConfigFilePath"]); } catch { }
 
-# ============================================================
-# 文件监视线程代码
-#   监视 cache 目录内所有文件的 LastWrite 变更
-#   - manual_request:   触发手动翻译（入队到 ManualWorkQueue）
-#   - chat_source:      提取聊天消息 → 发信号给主线程处理
-# ============================================================
-$fileMonitorCode = {
-    param($sync)
-
-    # Watcher 监视 AutoFilePath 所在目录
-    $autoDir = [System.IO.Path]::GetDirectoryName($sync.AutoFilePath)
-    if ([string]::IsNullOrEmpty($autoDir)) { $autoDir = "." }
-
-    $watcher = [System.IO.FileSystemWatcher]::new()
-    $watcher.Path         = $autoDir
-    $watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite
-    $watcher.EnableRaisingEvents = $true
-    $lastSendToGameTime = [DateTime]::MinValue
-
-    $lastAutoContent     = $null
-    $lastRequestContent  = $null
-
-    # 读取文件当前内容到历史（文件不存在时初始化为空），避免首次触发翻译
-    try {
-        $lastRequestContent = [System.IO.File]::ReadAllText($sync.RequestFilePath, [System.Text.UTF8Encoding]::new($false)).Trim()
-    } catch { $lastRequestContent = "" }
-    try {
-        $lastAutoContent = [System.IO.File]::ReadAllText($sync.AutoFilePath, [System.Text.UTF8Encoding]::new($false)).Trim()
-    } catch { $lastAutoContent = "" }
-
-    # 启动前检查 send_result 是否有残留内容，有则清空
-    try {
-        $initContent = [System.IO.File]::ReadAllText($sync.SendResultFile, [System.Text.UTF8Encoding]::new($false))
-        if (-not [string]::IsNullOrEmpty($initContent.Trim('"', ' ', "`t", "`r", "`n"))) {
-            [System.IO.File]::WriteAllText($sync.SendResultFile, "", [System.Text.UTF8Encoding]::new($false))
+        // 启动时清理 send_result 残留，防止发脏数据到游戏
+        try
+        {
+            string sendFile = (string)sync["SendResultFile"];
+            string raw = File.ReadAllText(sendFile, Encoding.UTF8).Trim('"', ' ', '\t', '\r', '\n');
+            if (!string.IsNullOrEmpty(raw)) WriteFileLocked(sendFile, "");
         }
-    } catch { $null = $_ }
+        catch { }
 
-    try { $lastConfigTime = ([System.IO.FileInfo]::new($sync.ConfigFilePath)).LastWriteTime } catch { $lastConfigTime = [DateTime]::MinValue }
-
-    while (-not $sync.StopFlag) {
-        $result = $watcher.WaitForChanged('Changed', 1000)
-        if ($sync.StopFlag) { break }
-        try {
-        if ($result.TimedOut) {
-            try {
-                $cfgFile = [System.IO.FileInfo]::new($sync.ConfigFilePath)
-                if ($cfgFile.Exists -and $cfgFile.LastWriteTime -ne $lastConfigTime) {
-                    $lastConfigTime = $cfgFile.LastWriteTime
-                    & $sync.ReadConfig -sync $sync
+        while (!ShouldStop(sync))
+        {
+            try
+            {
+                // ---- config.ini 热重载 ----
+                try
+                {
+                    DateTime cfgTime = File.GetLastWriteTime((string)sync["ConfigFilePath"]);
+                    if (cfgTime != lastConfigTime)
+                    {
+                        lastConfigTime = cfgTime;
+                        ReadConfig(sync);
+                    }
                 }
-            } catch { $null = $_ }
-            continue
-        }
+                catch { }
 
-# ---- 检查 send_result（发送内容到游戏）----
-        try {
-            $content = [System.IO.File]::ReadAllText($sync.SendResultFile, [System.Text.UTF8Encoding]::new($false))
-            $trimmed = $content.Trim('"', ' ', "`t", "`r", "`n")
-            if (-not [string]::IsNullOrEmpty($trimmed)) {
-                $sync.SendResultContent = $content
-                [System.IO.File]::WriteAllText($sync.SendResultFile, "", [System.Text.UTF8Encoding]::new($false))
-                $now = [DateTime]::Now
-                if (($now - $lastSendToGameTime).TotalMilliseconds -ge 30) {
-                    $lastSendToGameTime = $now
-                    $sync.SendToGameReady = $true
-                }
-            }
-        } catch { $null = $_ }
-        [System.Threading.Thread]::Sleep(50)
-
-        # ---- 检查 manual_request（内容比较，避免重复触发）----
-        try {
-            $content = [System.IO.File]::ReadAllText($sync.RequestFilePath, [System.Text.UTF8Encoding]::new($false))
-            if ($null -ne $content) { $content = $content.Trim() }
-            if ($content -ne "" -and $content -ne $lastRequestContent) {
-                $lastRequestContent = $content
-                $sync.ManualWorkQueue.Enqueue($content)
-            }
-        } catch { $null = $_ }
-
-        # ---- 检查 chat_source（内容比较，避免重复触发）----
-        try {
-            $content = [System.IO.File]::ReadAllText($sync.AutoFilePath, [System.Text.UTF8Encoding]::new($false))
-            if ($null -ne $content) { $content = $content.Trim() }
-            $content = [System.Text.Encoding]::UTF8.GetString([System.Text.Encoding]::UTF8.GetBytes($content))
-            if ($content -ne $lastAutoContent -and $content -ne "") {
-                $lastAutoContent = $content
-                $chatMsg = $content
-                $autoFields = $chatMsg -split '\|\|\|\|'
-                $autoText   = $autoFields[3]
-
-                $sync.NewAutoMessage = $chatMsg
-                $sync.NewAutoReady = $true
-                $sync.AutoFound++
-                $autoSender = if ($autoFields.Count -ge 3) { $autoFields[2] } else { "" }
-                $autoDisplay = $autoText -replace '[|]?i\d+,[^,]*,[^,]*,[^;]*;', '' -replace '\|.*?;', ''
-                if ($autoDisplay.Trim() -eq '') { $autoDisplay = $autoText }
-                $sync.StatusMessages.Enqueue(("[Auto:NewMsg] {0}:{1}" -f $autoSender, $autoDisplay.Substring(0, [Math]::Min(50, $autoDisplay.Length))))
-            }
-        } catch { $null = $_ }
-        } catch {
-            $sync.StatusMessages.Enqueue(("[FileMonitor:Error] $_"))
-        }
-    }
-
-    $watcher.Dispose()
-}
-
-# ============================================================
-# 自动翻译工作线程代码（3 个常驻 Runspace，从 AutoWorkQueue 取消息）
-# ============================================================
-$autoWorkerCode = {
-    param($sync, $workerId)
-    # 用一次避免 PSReviewUnusedParameter 假阳性
-    $null = $workerId
-
-    # 翻译尝试（最多重试一次）
-    function Invoke-Translate {
-        param([string]$txt, [string]$targetLang)
-        if ($sync.TranslateEngine -eq 1) { return (& $sync.InvokeGoogleTranslate -sync $sync -targetLang $targetLang -text $txt) }
-        if ($sync.TranslateEngine -ne 2) { return $null }
-        if (-not $sync.OutputApiKey) { return $null }
-        $chatCfg = $sync.AiPrompts.chat
-        $langCfg = $null
-        if ($chatCfg.langs) { $langCfg = $chatCfg.langs[$targetLang] }
-        $systemMsg = "You are a translator. Translate the following text to $targetLang. Only return the translated text, nothing else, no explanations."
-        if ($langCfg) { $systemMsg = $langCfg.system_prompt }
-
-        $msgs = @()
-        $msgs += @{ role = "system"; content = $systemMsg }
-        if ($langCfg.examples) {
-            foreach ($ex in $langCfg.examples) {
-                $msgs += @{ role = "user";      content = $ex.user }
-                $msgs += @{ role = "assistant"; content = $ex.assistant }
-            }
-        }
-        $wrapped = $txt
-        if ($chatCfg.wrap) { $wrapped = $chatCfg.wrap -replace '{text}', $txt }
-        $msgs += @{ role = "user"; content = $wrapped }
-
-        $config = @{}
-        if ($chatCfg.temperature) { $config.temperature = $chatCfg.temperature }
-        if ($chatCfg.top_p)       { $config.top_p = $chatCfg.top_p }
-        if ($chatCfg.max_tokens)  { $config.max_tokens = $chatCfg.max_tokens }
-        return (& $sync.InvokeChatAPI -sync $sync -endpoint $sync.OutputEndpoint -apiKey $sync.OutputApiKey -model $sync.OutputModel -messages $msgs -config $config)
-    }
-
-    while (-not $sync.StopFlag) {
-        # 从队列取消息（非阻塞，加锁保证 Count 检查和 Dequeue 原子性）
-        $messageText = $null
-        [System.Threading.Monitor]::Enter($sync.AutoWorkQueue.SyncRoot)
-        try {
-            if ($sync.AutoWorkQueue.Count -gt 0) {
-                $messageText = $sync.AutoWorkQueue.Dequeue()
-            }
-        } finally {
-            [System.Threading.Monitor]::Exit($sync.AutoWorkQueue.SyncRoot)
-        }
-        if ($null -eq $messageText) {
-            [System.Threading.Thread]::Sleep(100)
-            continue
-        }
-
-        try {
-        # 提取消息内容（去掉 |||| 格式）
-        $msgFields = $messageText -split "\|\|\|\|"
-        $rawMessage = ""
-        $channel = ""
-        $senderName = ""
-        $targetLang = ""
-        if ($msgFields.Count -ge 4) {
-            $channel    = $msgFields[1]
-            $senderName = $msgFields[2]
-            $rawMessage = $msgFields[3]
-            if ($msgFields.Count -ge 5) { $targetLang = $msgFields[4] }
-        } else {
-            $rawMessage = $messageText
-        }
-
-        # 提取物品链接 → 替换为占位符 @^，翻译完恢复
-        $itemLinkPattern = '[|]?i\d+,[^,]*,[^,]*,[^;]*;'
-        $itemLinks = @()
-        $matchedItems = [regex]::Matches($rawMessage, $itemLinkPattern)
-        foreach ($m in $matchedItems) { $itemLinks += $m.Value }
-        $processedMessage = [regex]::Replace($rawMessage, $itemLinkPattern, "@^")
-
-        # 提取招募链接 → 替换为占位符 @&，翻译完恢复
-        $recruitLinkPattern = '\|.*?;'
-        $recruitLinks = @()
-        $matchedItems = [regex]::Matches($processedMessage, $recruitLinkPattern)
-        foreach ($m in $matchedItems) { $recruitLinks += $m.Value }
-        $processedMessage = [regex]::Replace($processedMessage, $recruitLinkPattern, "@&")
-
-        # 去掉占位符检查是否还有实际文本内容，如果只有链接则跳过翻译
-        $textToTranslate = $processedMessage -replace '@\^', '' -replace '@&', '' -replace '\s', ''
-        if ($textToTranslate -eq "") {
-            $sync.AutoSkipped++
-            continue
-        }
-
-        # 判断是否需要翻译（检测文本语言是否与目标语言相同）
-        if (-not (& $sync.NeedTranslate -text $textToTranslate -lang $targetLang)) {
-            $sync.AutoSkipped++
-            continue
-        }
-
-        $translation = Invoke-Translate -txt $processedMessage -targetLang $targetLang
-        if ($null -eq $translation -or $translation -eq "") {
-            [System.Threading.Thread]::Sleep(1000)
-            $translation = Invoke-Translate -txt $processedMessage -targetLang $targetLang
-        }
-
-        # 恢复物品链接和招募链接
-        if ($null -ne $translation -and $translation -ne "") {
-            for ($i = 0; $i -lt $itemLinks.Count; $i++) {
-                $translation = [regex]::Replace($translation, [regex]::Escape("@^"), $itemLinks[$i], 1)
-            }
-            for ($i = 0; $i -lt $recruitLinks.Count; $i++) {
-                $translation = [regex]::Replace($translation, [regex]::Escape("@&"), $recruitLinks[$i], 1)
-            }
-            # 移除 AI 可能保留的 <> 包裹符号
-            $translation = $translation -replace '[<>\[\]]', ''
-        }
-
-        if ($null -ne $translation -and $translation -ne "") {
-            # 成功：写缓存 + 写 response 文件
-            [System.Threading.Monitor]::Enter($sync.Cache.SyncRoot)
-            try {
-                if (-not $sync.Cache.ContainsKey($rawMessage)) {
-                    if ($sync.Cache.Count -ge $sync.CacheMaxSize) {
-                        $newestKey = $null; $newestHitCount = 0; $newestTime = [DateTime]::MinValue
-                        $secondNewestKey = $null; $secondNewestTime = [DateTime]::MinValue
-                        foreach ($entry in $sync.Cache.GetEnumerator()) {
-                            $t = $entry.Value.lastHit
-                            if ($t -gt $newestTime) {
-                                $secondNewestKey = $newestKey; $secondNewestTime = $newestTime
-                                $newestKey = $entry.Key; $newestHitCount = $entry.Value.hitCount; $newestTime = $t
-                            } elseif ($t -gt $secondNewestTime) {
-                                $secondNewestKey = $entry.Key; $secondNewestTime = $t
+                // ---- SendResult 检查 ----
+                string sendFile = (string)sync["SendResultFile"];
+                string sendContent = ReadLuaFile(sendFile);
+                if (!string.IsNullOrEmpty(sendContent) && sendContent != lastSend)
+                {
+                    lastSend = sendContent;
+                    if ((bool)sync["IsAdmin"])
+                    {
+                        WriteFileLocked(sendFile, "");
+                        var now = DateTime.Now;
+                        if ((now - lastSendTime).TotalMilliseconds >= 30)
+                        {
+                            lastSendTime = now;
+                            lock (sync.SyncRoot)
+                            {
+                                sync["SendResultContent"] = sendContent;
+                                sync["SendToGameReady"] = true;
                             }
                         }
-                        if ($newestHitCount -ge 3 -and $sync.Cache.Count -gt 1) {
-                            $sync.Cache.Remove($secondNewestKey)
-                        } else {
-                            $sync.Cache.Remove($newestKey)
+                    }
+                }
+
+                // ---- manual_request 检查 ----
+                string reqFile = (string)sync["RequestFilePath"];
+                string reqContent = ReadLuaFile(reqFile);
+                if (!string.IsNullOrEmpty(reqContent) && reqContent != lastManual)
+                {
+                    lastManual = reqContent;
+                    lock (manualQ.SyncRoot) { manualQ.Enqueue(reqContent); }
+                }
+
+                // ---- chat_source 检查 ----
+                string autoFile = (string)sync["AutoFilePath"];
+                string autoContent = ReadLuaFile(autoFile);
+                if (!string.IsNullOrEmpty(autoContent) && autoContent != lastAuto)
+                {
+                    lastAuto = autoContent;
+                    autoContent = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(autoContent));
+                    lock (sync.SyncRoot)
+                    {
+                        sync["NewAutoMessage"] = autoContent;
+                        sync["NewAutoReady"] = true;
+                        sync["AutoFound"] = (int)sync["AutoFound"] + 1;
+                    }
+                    try
+                    {
+                        string[] fs = autoContent.Split(new[] { "||||" }, StringSplitOptions.None);
+                        string sender = fs.Length >= 3 ? fs[2] : "";
+                        string rawText = "";
+                        if (fs.Length >= 4) try { rawText = Encoding.UTF8.GetString(Convert.FromBase64String(fs[3])); } catch { rawText = fs[3]; }
+                        string disp = Regex.Replace(rawText, @"[|]?i\d+,[^,]*,[^,]*,[^;]*;", "");
+                        disp = Regex.Replace(disp, @"\|.*?;", "");
+                        if (disp.Trim() == "") disp = rawText;
+                        if (disp.Length > 50) disp = disp.Substring(0, 50);
+                        Console.WriteLine("[Auto:NewMsg] {0}:{1}", sender, disp);
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[FileMonitor:Error] " + ex.Message);
+            }
+            Thread.Sleep(50);
+        }
+    }
+
+    // ========== 手动翻译 Worker ==========
+    private static void ManualWorkerProc(object state)
+    {
+        var sync = (Hashtable)state;
+        var manualQ = (Queue)sync["ManualWorkQueue"];
+        var cache = (Hashtable)sync["Cache"];
+        var cmax = (int)sync["CacheMaxSize"];
+        var tmo = (int)sync["HttpTimeoutSec"];
+
+        while (!ShouldStop(sync))
+        {
+            string content = null;
+            lock (manualQ.SyncRoot)
+            {
+                if (manualQ.Count > 0) content = (string)manualQ.Dequeue();
+            }
+            if (content == null) { Thread.Sleep(100); continue; }
+
+            try
+            {
+                // 解析字段
+                string[] fields = content.Split(new[] { "||||" }, StringSplitOptions.None);
+                string typeStr = fields.Length >= 2 ? fields[1] : "";
+                string playerName = fields.Length >= 3 ? fields[2] : "";
+                string msgText = content;
+                string timestamp = fields.Length >= 5 ? fields[4] : "";
+                if (fields.Length >= 4)
+                {
+                    try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); }
+                    catch { msgText = fields[3]; }
+                }
+                if (string.IsNullOrEmpty(msgText.Trim())) continue;
+
+                int translateType = 0;
+                int.TryParse(typeStr, out translateType);
+
+                // 翻译
+                string manualTargetLang = "en";
+                switch (translateType)
+                {
+                    case 1: manualTargetLang = "en"; break;
+                    case 2: manualTargetLang = "ru"; break;
+                    case 3: manualTargetLang = "zh"; break;
+                    case 4: manualTargetLang = "ru"; break;
+                    case 5: manualTargetLang = "zh"; break;
+                    case 6: manualTargetLang = "en"; break;
+                }
+
+                string result = null;
+                int engine = (int)sync["TranslateEngine"];
+
+                if (engine == 1)
+                {
+                    result = InvokeGoogleTranslate(tmo, manualTargetLang, msgText);
+                }
+                else if (engine == 2)
+                {
+                    string key = (string)sync["InputApiKey"];
+                    if (string.IsNullOrEmpty(key))
+                    {
+                        Console.WriteLine("[Input:Error] No API Key configured");
+                        continue;
+                    }
+                    // 构建 ChatAPI 消息
+                    var aiPrompts = (Hashtable)sync["AiPrompts"];
+                    var manualCfg = aiPrompts != null ? (Hashtable)aiPrompts["manual"] : null;
+                    string systemMsg = "You are a translator. Translate the following text to " + manualTargetLang + ". Only return the translated text, nothing else, no explanations.";
+                    if (manualCfg != null && manualCfg.Contains("by_type"))
+                    {
+                        var byType = (Hashtable)manualCfg["by_type"];
+                        if (byType.Contains(typeStr))
+                        {
+                            var tc = (Hashtable)byType[typeStr];
+                            if (tc.Contains("system_prompt")) systemMsg = (string)tc["system_prompt"];
                         }
                     }
-                    $sync.Cache[$rawMessage] = @{
-                        translation = $translation
-                        hitCount    = 0
-                        lastHit     = [DateTime]::Now
+                    var msgs = new ArrayList();
+                    msgs.Add(new Hashtable { { "role", "system" }, { "content", systemMsg } });
+                    if (manualCfg != null && manualCfg.Contains("examples"))
+                    {
+                        var examples = (ArrayList)manualCfg["examples"];
+                        foreach (Hashtable ex in examples)
+                        {
+                            msgs.Add(new Hashtable { { "role", "user" }, { "content", ex["user"] } });
+                            msgs.Add(new Hashtable { { "role", "assistant" }, { "content", ex["assistant"] } });
+                        }
+                    }
+                    string wrapped = msgText;
+                    if (manualCfg != null && manualCfg.Contains("wrap"))
+                        wrapped = ((string)manualCfg["wrap"]).Replace("{text}", msgText);
+                    msgs.Add(new Hashtable { { "role", "user" }, { "content", wrapped } });
+
+                    var config = new Hashtable();
+                    if (manualCfg != null)
+                    {
+                        if (manualCfg.Contains("temperature")) config["temperature"] = manualCfg["temperature"];
+                        if (manualCfg.Contains("top_p")) config["top_p"] = manualCfg["top_p"];
+                        if (manualCfg.Contains("max_tokens")) config["max_tokens"] = manualCfg["max_tokens"];
+                    }
+                    result = InvokeChatAPI(tmo,
+                        (string)sync["InputEndpoint"],
+                        (string)sync["InputApiKey"],
+                        (string)sync["InputModel"],
+                        msgs, config);
+                }
+
+                // 输出结果
+                if (!string.IsNullOrEmpty(result))
+                {
+                    string utf8Result = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(result));
+                    string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(utf8Result));
+                    string origB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(msgText));
+                    string output = "{chatMsg = \"||||" + playerName + "||||" + b64 + "||||" + origB64 + "||||" + timestamp + "||||\"}";
+
+                    // 先打印
+                    lock (sync.SyncRoot) { sync["ManualSent"] = (int)sync["ManualSent"] + 1; }
+                    string display = (msgText.Replace(" ", "")).Substring(0, Math.Min(10, msgText.Replace(" ", "").Length));
+                    Console.WriteLine("[Input:Done] [{0}] {1}", display,
+                        result.Substring(0, Math.Min(50, result.Length)));
+
+                    // 再写文件
+                    WriteFileLocked((string)sync["ManualOutFile"], output);
+                }
+                else
+                {
+                    lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
+                    Console.WriteLine("[Input:Error]");
+                    string errB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes("[Error]"));
+                    string errOut = "{chatMsg = \"||||" + playerName + "||||" + errB64 + "||||" + timestamp + "||||\"}";
+                    WriteFileLocked((string)sync["ManualOutFile"], errOut);
+                }
+            }
+            catch (Exception ex)
+            {
+                lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
+                Console.WriteLine("[Input:Error] " + ex.Message);
+            }
+        }
+    }
+
+    // ========== 自动翻译 Worker ==========
+    private static void AutoWorkerProc(object state)
+    {
+        var args = (object[])state;
+        var sync = (Hashtable)args[0];
+        int wid = (int)args[1];
+        var autoQ = (Queue)sync["AutoWorkQueue"];
+        var cache = (Hashtable)sync["Cache"];
+        var cmax = (int)sync["CacheMaxSize"];
+        var tmo = (int)sync["HttpTimeoutSec"];
+
+        while (!ShouldStop(sync))
+        {
+            string content = null;
+            lock (autoQ.SyncRoot)
+            {
+                if (autoQ.Count > 0) content = (string)autoQ.Dequeue();
+            }
+            if (content == null) { Thread.Sleep(50); continue; }
+
+            try
+            {
+                // 解析字段
+                string[] fields = content.Split(new[] { "||||" }, StringSplitOptions.None);
+                string channel = fields.Length >= 2 ? fields[1] : "";
+                string senderName = fields.Length >= 3 ? fields[2] : "";
+                string targetLang = fields.Length >= 5 ? fields[4] : "en";
+                if (string.IsNullOrEmpty(targetLang)) targetLang = "en";
+                string msgText = content;
+                if (fields.Length >= 4)
+                {
+                    try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); }
+                    catch { msgText = fields[3]; }
+                }
+
+                // 查缓存
+                string cacheKey = fields.Length >= 4 ? fields[3] : content;
+                string cached = GetCache(cache, cacheKey);
+                if (cached != null)
+                {
+                    lock (sync.SyncRoot) { sync["AutoCached"] = (int)sync["AutoCached"] + 1; }
+                    continue;
+                }
+
+                // 判断是否需要翻译
+                if (!NeedTranslate(msgText, targetLang))
+                {
+                    lock (sync.SyncRoot) { sync["AutoSkipped"] = (int)sync["AutoSkipped"] + 1; }
+                    continue;
+                }
+
+                // 提取物品链接和招募链接（保护特殊格式，防止被翻译破坏）
+                string itemLinkPattern = @"[|]?i\d+,[^,]*,[^,]*,[^;]*;";
+                var itemLinks = new ArrayList();
+                var itemMatches = Regex.Matches(msgText, itemLinkPattern);
+                foreach (Match m in itemMatches) itemLinks.Add(m.Value);
+                string processText = Regex.Replace(msgText, itemLinkPattern, "@^");
+
+                string recruitLinkPattern = @"\|.*?;";
+                var recruitLinks = new ArrayList();
+                var recruitMatches = Regex.Matches(processText, recruitLinkPattern);
+                foreach (Match m in recruitMatches) recruitLinks.Add(m.Value);
+                processText = Regex.Replace(processText, recruitLinkPattern, "@&");
+
+                // 调用翻译
+                string translation = null;
+                int engine = (int)sync["TranslateEngine"];
+                var aiPrompts = (Hashtable)sync["AiPrompts"];
+                ArrayList msgs2 = null;
+                Hashtable config2 = null;
+
+                if (engine == 1)
+                {
+                    translation = InvokeGoogleTranslate(tmo, targetLang, processText);
+                }
+                else if (engine == 2)
+                {
+                    var autoCfg = aiPrompts != null ? (Hashtable)aiPrompts["chat"] : null;
+                    Hashtable langCfg = null;
+                    if (autoCfg != null && autoCfg.Contains("langs"))
+                    {
+                        var langs = (Hashtable)autoCfg["langs"];
+                        if (langs != null && langs.Contains(targetLang))
+                            langCfg = (Hashtable)langs[targetLang];
+                    }
+                    string systemMsg = "You are a translator. Translate the following text to " + targetLang + ". Only return the translated text, nothing else, no explanations.";
+                    if (langCfg != null && langCfg.Contains("system_prompt"))
+                        systemMsg = (string)langCfg["system_prompt"];
+                    else if (autoCfg != null && autoCfg.Contains("system_prompt"))
+                        systemMsg = (string)autoCfg["system_prompt"];
+
+                    msgs2 = new ArrayList();
+                    msgs2.Add(new Hashtable { { "role", "system" }, { "content", systemMsg } });
+                    ArrayList examples = null;
+                    if (langCfg != null && langCfg.Contains("examples"))
+                        examples = (ArrayList)langCfg["examples"];
+                    else if (autoCfg != null && autoCfg.Contains("examples"))
+                        examples = (ArrayList)autoCfg["examples"];
+                    if (examples != null)
+                    {
+                        foreach (Hashtable ex in examples)
+                        {
+                            msgs2.Add(new Hashtable { { "role", "user" }, { "content", ex["user"] } });
+                            msgs2.Add(new Hashtable { { "role", "assistant" }, { "content", ex["assistant"] } });
+                        }
+                    }
+                    string wrapped = processText;
+                    if (autoCfg != null && autoCfg.Contains("wrap"))
+                        wrapped = ((string)autoCfg["wrap"]).Replace("{text}", processText);
+                    msgs2.Add(new Hashtable { { "role", "user" }, { "content", wrapped } });
+
+                    config2 = new Hashtable();
+                    if (autoCfg != null)
+                    {
+                        if (autoCfg.Contains("temperature")) config2["temperature"] = autoCfg["temperature"];
+                        if (autoCfg.Contains("top_p")) config2["top_p"] = autoCfg["top_p"];
+                        if (autoCfg.Contains("max_tokens")) config2["max_tokens"] = autoCfg["max_tokens"];
+                    }
+                    translation = InvokeChatAPI(tmo,
+                        (string)sync["OutputEndpoint"],
+                        (string)sync["OutputApiKey"],
+                        (string)sync["OutputModel"],
+                        msgs2, config2);
+                }
+
+                // 翻译失败时重试一次
+                if (string.IsNullOrEmpty(translation))
+                {
+                    Thread.Sleep(1000);
+                    if (engine == 1)
+                    {
+                        translation = InvokeGoogleTranslate(tmo, targetLang, processText);
+                    }
+                    else if (engine == 2)
+                    {
+                        translation = InvokeChatAPI(tmo,
+                            (string)sync["OutputEndpoint"],
+                            (string)sync["OutputApiKey"],
+                            (string)sync["OutputModel"],
+                            msgs2, config2);
                     }
                 }
-            } finally {
-                [System.Threading.Monitor]::Exit($sync.Cache.SyncRoot)
-            }
-            # 写 translated_messages（main.lua 读取并显示在聊天框）
-            try {
-                $prefix = "||||" + $channel + "||||" + $senderName + "||||"
-                $translationBytes = [System.Text.Encoding]::UTF8.GetBytes($translation)
-                $b64 = [Convert]::ToBase64String($translationBytes)
-                $timestamp = if ($msgFields.Count -ge 6) { $msgFields[5] } else { "" }
-                $logEntry = "{chatMsg = `"$prefix$b64||||$timestamp||||`"}"
-                [System.IO.File]::WriteAllText($sync.AutoOutFile, $logEntry, [System.Text.UTF8Encoding]::new($false))
-            } catch { $null = $_ }
-            $sync.AutoSent++
-            $translationDisplay = $translation -replace '[|]?i\d+,[^,]*,[^,]*,[^;]*;', ''
 
-            $sync.StatusMessages.Enqueue(("[Auto#$($workerId):Done] {0}:{1}" -f $senderName, $translationDisplay.Substring(0, [Math]::Min(50, $translationDisplay.Length))))
-        } else {
-            $sync.Failed++
-            $sync.StatusMessages.Enqueue("[Auto#$($workerId):Error]")
-        }
-        } catch {
-            $sync.Failed++
-            $sync.StatusMessages.Enqueue(("[Auto#$($workerId):Error] $_"))
-        }
-    }
-}
+                if (!string.IsNullOrEmpty(translation))
+                {
+                    // 恢复物品链接和招募链接
+                    for (int i = 0; i < itemLinks.Count; i++)
+                        translation = Regex.Replace(translation, Regex.Escape("@^"), (string)itemLinks[i]);
+                    for (int i = 0; i < recruitLinks.Count; i++)
+                        translation = Regex.Replace(translation, Regex.Escape("@&"), (string)recruitLinks[i]);
+                    translation = translation.Replace("<", "").Replace(">", "").Replace("[", "").Replace("]", "");
+                    // 写文件
+                    string prefix = "||||" + channel + "||||" + senderName + "||||";
+                    string tB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(translation));
+                    string ts = fields.Length >= 6 ? fields[5] : "";
+                    string logEntry = "{chatMsg = \"" + prefix + tB64 + "||||" + ts + "||||\"}";
+                    WriteChatResultLocked((string)sync["AutoOutFile"], logEntry);
 
-# ============================================================
-# 启动文件监视线程
-# ============================================================
-# ============================================================
-$fileMonitorRS = [RunspaceFactory]::CreateRunspace([InitialSessionState]::CreateDefault())
-$fileMonitorRS.Open()
-$fileMonitorPS = [PowerShell]::Create()
-$fileMonitorPS.Runspace = $fileMonitorRS
-$fileMonitorPS.AddScript($fileMonitorCode).AddArgument($sync) | Out-Null
-$fileMonitorPS.BeginInvoke() | Out-Null
-[System.Console]::WriteLine("[Start] File monitoring thread")
+                    lock (sync.SyncRoot) { sync["AutoSent"] = (int)sync["AutoSent"] + 1; }
 
-# ============================================================
-# 启动 3 个自动翻译 Worker + 1 个手动翻译 Worker（长驻 Runspace）
-# ============================================================
-$workers = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
-foreach ($id in 1..3) {
-    $rs = [RunspaceFactory]::CreateRunspace([InitialSessionState]::CreateDefault())
-    $rs.Open()
-    $ps = [PowerShell]::Create()
-    $ps.Runspace = $rs
-    $ps.AddScript($autoWorkerCode).AddArgument($sync).AddArgument($id) | Out-Null
-    $ps.BeginInvoke() | Out-Null
-    $workers.Add(@{ PS = $ps; RS = $rs; Type = "Auto"; Id = $id }) | Out-Null
-    [System.Console]::WriteLine("[Start] Auto worker #${id} started")
-}
-$manualRS = [RunspaceFactory]::CreateRunspace([InitialSessionState]::CreateDefault())
-$manualRS.Open()
-$manualPS = [PowerShell]::Create()
-$manualPS.Runspace = $manualRS
-$manualPS.AddScript($manualWorkerCode).AddArgument($sync) | Out-Null
-$manualPS.BeginInvoke() | Out-Null
-$workers.Add(@{ PS = $manualPS; RS = $manualRS; Type = "Manual" }) | Out-Null
-[System.Console]::WriteLine("[Start] Manual worker started")
-# ============================================================
-# 主线程循环
-#   50ms 轮询 → 查缓存 → 待翻译数组 → 入队到工作队列
-# ============================================================
-[System.Console]::WriteLine("")
-[System.Console]::WriteLine("=== Running ===")
-[System.Console]::WriteLine("Auto messages: $AutoFilePath")
-[System.Console]::WriteLine("Manual requests: $RequestFilePath")
-[System.Console]::WriteLine("Input model (manual): $($sync.InputModel)")
-[System.Console]::WriteLine("Input endpoint: $($sync.InputEndpoint)")
-[System.Console]::WriteLine("Output model (auto): $($sync.OutputModel)")
-[System.Console]::WriteLine("Output endpoint: $($sync.OutputEndpoint)")
-[System.Console]::WriteLine("Max concurrency: ${MaxConcurrentThreads} threads")
-[System.Console]::WriteLine("Cache limit: ${CacheMaxSize} entries")
-[System.Console]::WriteLine("")
-try {
-    # 单实例 Mutex 创建（与 finally 中的 Dispose 配对，确保清理）
-    $createdNew = $false
-    try {
-        $script:appMutex = [System.Threading.Mutex]::new($false, $mutexName, [ref]$createdNew)
-        if (-not $createdNew) {
-            [System.Console]::WriteLine("[Error] Another instance is already running!")
-            exit 1
-        }
-    } catch [System.Threading.AbandonedMutexException] {
-        $script:appMutex = $_.Mutex
-        [System.Console]::WriteLine("[Warning] Previous instance was terminated abnormally, taking over.")
-    }
+                    // 入缓存
+                    SetCache(cache, cmax, cacheKey, translation);
 
-    $mainLoopMs = 20  # 20ms 轮询间隔
-    $sync.IsAdmin = Test-Admin
-    if ($sync.IsAdmin) {
-            [System.Console]::Title = "[Admin] AAFreeTranslation"
-        [System.Console]::WriteLine("[Main Thread] Send Enabled")
-    } else {
-            [System.Console]::Title = "[User] AAFreeTranslation"
-        [System.Console]::WriteLine("[Main Thread] Send Disabled")
-    }
-
-
-    try { [TrayManager]::Initialize() } catch {$null = $_ }
-
-    while ($true) {
-        try {
-            # 检查自动消息信号
-            if ($sync.NewAutoReady) {
-                $msg = $sync.NewAutoMessage
-                $sync.NewAutoReady = $false
-                $sync.NewAutoMessage = $null
-
-                # 查缓存（使用实际消息内容作为 key）
-                $cacheFields = $msg -split '\|\|\|\|'
-                $cacheKey = if ($cacheFields.Count -ge 4) { $cacheFields[3] } else { $msg }
-                if ($sync.Cache.ContainsKey($cacheKey)) {
-                    $entry = $sync.Cache[$cacheKey]
-                    $entry.hitCount++
-                    $entry.lastHit = [DateTime]::Now
-                    # 缓存命中 → 直接写结果
-                    try {
-                        $cacheChannel = if ($cacheFields.Count -ge 2) { $cacheFields[1] } else { "" }
-                        $cacheSender = if ($cacheFields.Count -ge 3) { $cacheFields[2] } else { "" }
-                        $cacheBytes = [System.Text.Encoding]::UTF8.GetBytes($entry.translation)
-                        $cacheB64 = [Convert]::ToBase64String($cacheBytes)
-                        $cacheTimestamp = if ($cacheFields.Count -ge 6) { $cacheFields[5] } else { "" }
-                        $cacheOutput = "{chatMsg = `"||||" + $cacheChannel + "||||" + $cacheSender + "||||" + $cacheB64 + "||||" + $cacheTimestamp + "||||`"}"
-                        [System.IO.File]::WriteAllText($sync.AutoOutFile, $cacheOutput, [System.Text.UTF8Encoding]::new($false))
-                    } catch { $null = $_ }
-                    $sync.AutoCached++
-                    [System.Console]::WriteLine(("[Auto:Cache] {0}" -f $entry.translation.Substring(0, [Math]::Min(50, $entry.translation.Length))))
-                } else {
-                    # 未命中 → 加入待翻译数组
-                    $sync.PendingMessages.Add($msg) | Out-Null
-                    $addFields = $msg -split '\|\|\|\|'
-                    $addText = if ($addFields.Count -ge 4) { $addFields[3] } else { $msg }
-                    [System.Console]::WriteLine(("[Auto:Cache] add: {0}" -f $addText.Substring(0, [Math]::Min(50, $addText.Length))))
+                    string disp = translation;
+                    Console.WriteLine("[Auto#{0}:Done] {1}:{2}", wid, senderName,
+                        disp.Substring(0, Math.Min(50, disp.Length)));
+                }
+                else
+                {
+                    lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
+                    Console.WriteLine("[Auto#" + wid + ":Error]");
                 }
             }
-
-            # 检查发送游戏信号
-            if ($sync.SendToGameReady) {
-                $sync.SendToGameReady = $false
-                $sendData = $sync.SendResultContent
-                $sync.SendResultContent = $null
-                & $sync.SendToGame -sendData $sendData
+            catch (Exception ex)
+            {
+                lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
+                Console.WriteLine("[Auto#" + wid + ":Error] " + ex.Message);
             }
+        }
+    }
 
-            # 从待翻译数组取消息，入队到自动翻译工作队列（3 个常驻 Worker 消费）
-            while ($sync.PendingMessages.Count -gt 0) {
-                $msg = $sync.PendingMessages[0]
-                $sync.PendingMessages.RemoveAt(0)
+    // ========== Native P/Invoke 辅助类 ==========
+    private static class NativeWin32
+    {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int count);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessageA(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")]
+        public static extern bool OpenClipboard(IntPtr hWndNewOwner);
+        [DllImport("user32.dll")]
+        public static extern bool EmptyClipboard();
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+        [DllImport("user32.dll")]
+        public static extern bool CloseClipboard();
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GlobalLock(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        public static extern bool GlobalUnlock(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GlobalFree(IntPtr hMem);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetCurrentProcess();
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern void CloseHandle(IntPtr hObject);
+    }
 
-                # 再次查缓存（使用实际消息内容作为 key）
-                $cacheFields2 = $msg -split '\|\|\|\|'
-                $cacheKey2 = if ($cacheFields2.Count -ge 4) { $cacheFields2[3] } else { $msg }
-                if ($sync.Cache.ContainsKey($cacheKey2)) {
-                    $entry = $sync.Cache[$cacheKey2]
-                    $entry.hitCount++
-                    $entry.lastHit = [DateTime]::Now
-                    try {
-                        $cacheChannel2 = if ($cacheFields2.Count -ge 2) { $cacheFields2[1] } else { "" }
-                        $cacheSender2 = if ($cacheFields2.Count -ge 3) { $cacheFields2[2] } else { "" }
-                        $cacheBytes2 = [System.Text.Encoding]::UTF8.GetBytes($entry.translation)
-                        $cacheB642 = [Convert]::ToBase64String($cacheBytes2)
-                        $cacheTimestamp2 = if ($cacheFields2.Count -ge 6) { $cacheFields2[5] } else { "" }
-                        $cacheOutput2 = "{chatMsg = `"||||" + $cacheChannel2 + "||||" + $cacheSender2 + "||||" + $cacheB642 + "||||" + $cacheTimestamp2 + "||||`"}"
-                        [System.IO.File]::WriteAllText($sync.AutoOutFile, $cacheOutput2, [System.Text.UTF8Encoding]::new($false))
-                    } catch { $null = $_ }
-                    $sync.AutoCached++
-                    [System.Console]::WriteLine(("[Auto:Cache] {0}" -f $entry.translation.Substring(0, [Math]::Min(50, $entry.translation.Length))))
-                    continue
+    // ========== 配置读取 ==========
+    public static void ReadConfig(Hashtable sync)
+    {
+        try
+        {
+            string path = (string)sync["ConfigFilePath"];
+            string raw = File.ReadAllText(path, Encoding.UTF8);
+            var cfg = new Hashtable();
+            if (!string.IsNullOrEmpty(raw))
+            {
+                var matches = Regex.Matches(raw, @"(\w+)\s*=\s*""?([^"",}\s]+)""?");
+                foreach (Match m in matches)
+                    cfg[m.Groups[1].Value] = m.Groups[2].Value;
+            }
+            if (cfg.ContainsKey("inputBaseURL"))    sync["InputEndpoint"] = cfg["inputBaseURL"];
+            if (cfg.ContainsKey("inputApiKey"))     sync["InputApiKey"] = cfg["inputApiKey"];
+            if (cfg.ContainsKey("inputModelName"))  sync["InputModel"] = ((string)cfg["inputModelName"]).ToLower();
+            if (cfg.ContainsKey("outputBaseURL"))   sync["OutputEndpoint"] = cfg["outputBaseURL"];
+            if (cfg.ContainsKey("outputApiKey"))    sync["OutputApiKey"] = cfg["outputApiKey"];
+            if (cfg.ContainsKey("outputModelName")) sync["OutputModel"] = ((string)cfg["outputModelName"]).ToLower();
+            if (cfg.ContainsKey("translateEngine")) sync["TranslateEngine"] = int.Parse((string)cfg["translateEngine"]);
+            Console.WriteLine("[Config] Reloaded Config.ini");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[Config] Error: " + ex.Message);
+        }
+    }
+
+    // ========== 字典转 Hashtable（递归） ==========
+    private static object DeepToHashtable(object obj)
+    {
+        var dict = obj as Dictionary<string, object>;
+        if (dict != null)
+        {
+            var ht = new Hashtable();
+            foreach (var kv in dict)
+                ht[kv.Key] = DeepToHashtable(kv.Value);
+            return ht;
+        }
+        var arr = obj as object[];
+        if (arr != null)
+        {
+            var list = new ArrayList(arr.Length);
+            for (int i = 0; i < arr.Length; i++)
+                list.Add(DeepToHashtable(arr[i]));
+            return list;
+        }
+        var list2 = obj as ArrayList;
+        if (list2 != null)
+        {
+            for (int i = 0; i < list2.Count; i++)
+                list2[i] = DeepToHashtable(list2[i]);
+            return list2;
+        }
+        return obj;
+    }
+
+    // ========== 创建共享数据 ==========
+    public static Hashtable CreateSync()
+    {
+        var sync = Hashtable.Synchronized(new Hashtable());
+
+        // 数据字段
+        sync["StopFlag"] = false;
+        sync["NewAutoMessage"] = null;
+        sync["NewAutoReady"] = false;
+        sync["PendingMessages"] = ArrayList.Synchronized(new ArrayList());
+        sync["Cache"] = Hashtable.Synchronized(new Hashtable());
+        sync["CacheMaxSize"] = 100;
+        sync["AutoWorkQueue"] = Queue.Synchronized(new Queue());
+        sync["ManualWorkQueue"] = Queue.Synchronized(new Queue());
+
+        // 文件路径
+        sync["AutoFilePath"] = ".\\cache\\chat_source";
+        sync["RequestFilePath"] = ".\\cache\\manual_request";
+        sync["ManualOutFile"] = ".\\cache\\manual_response";
+        sync["AutoOutFile"] = Path.GetFullPath(".\\cache\\chat_result");
+        sync["ConfigFilePath"] = Path.GetFullPath(".\\config.ini");
+        sync["SendResultFile"] = Path.GetFullPath(".\\cache\\send_result");
+
+        // 配置参数
+        sync["HttpTimeoutSec"] = 5;
+        sync["RetryIntervalSec"] = 5;
+        sync["MaxConcurrent"] = 4;
+        sync["SendToGameReady"] = false;
+        sync["SendResultContent"] = null;
+        sync["TranslateEngine"] = 1;
+        sync["InputEndpoint"] = "";
+        sync["InputApiKey"] = "";
+        sync["InputModel"] = "";
+        sync["OutputEndpoint"] = "";
+        sync["OutputApiKey"] = "";
+        sync["OutputModel"] = "";
+
+        // 统计
+        sync["AutoFound"] = 0;
+        sync["AutoCached"] = 0;
+        sync["AutoSent"] = 0;
+        sync["ManualSent"] = 0;
+        sync["AutoSkipped"] = 0;
+        sync["Failed"] = 0;
+
+        // 加载 ai_prompts.json
+        try
+        {
+            string promptFile = ".\\ai_prompts.json";
+            string raw = File.ReadAllText(promptFile, Encoding.UTF8);
+            var jss = new System.Web.Script.Serialization.JavaScriptSerializer();
+            jss.MaxJsonLength = int.MaxValue;
+            var deserialized = jss.DeserializeObject(raw);
+            sync["AiPrompts"] = DeepToHashtable(deserialized);
+            Console.WriteLine("[Config] Loaded ai_prompts.json");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[Config] Load ai_prompts.json Error: " + ex.Message);
+        }
+
+        // 读取 config.ini
+        ReadConfig(sync);
+
+        return sync;
+    }
+
+    // ========== 一站式入口：C# 内部管理完整生命周期（含 Ctrl+C 处理） ==========
+    public static void Start()
+    {
+        Console.CancelKeyPress += (sender, args) =>
+        {
+            args.Cancel = true;
+            _running = false;
+        };
+
+        var sync = CreateSync();
+        try
+        {
+            StartAll(sync);
+            while (_running)
+            {
+                try { if ((bool)sync["StopFlag"]) break; } catch { break; }
+                Thread.Sleep(500);
+            }
+        }
+        finally
+        {
+            CleanupAll(sync);
+        }
+    }
+
+    // ========== 缓存命中写入 ==========
+    public static void WriteCacheHit(Hashtable sync, string msg, Hashtable entry)
+    {
+        try
+        {
+            string[] fields = msg.Split(new[] { "||||" }, StringSplitOptions.None);
+            string channel = fields.Length >= 2 ? fields[1] : "";
+            string sender = fields.Length >= 3 ? fields[2] : "";
+            string translation = (string)entry["translation"];
+            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(translation));
+            string ts = fields.Length >= 6 ? fields[5] : "";
+            string output = "{chatMsg = \"||||" + channel + "||||" + sender + "||||" + b64 + "||||" + ts + "||||\"}";
+            WriteChatResultLocked((string)sync["AutoOutFile"], output);
+            lock (sync.SyncRoot) { sync["AutoCached"] = (int)sync["AutoCached"] + 1; }
+            Console.WriteLine("[Auto:Cache] " + translation.Substring(0, Math.Min(50, translation.Length)));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[Auto:CacheWriteError] " + ex.Message);
+        }
+    }
+
+    // ========== Admin检测 ==========
+    private const int TokenElevation = 20;
+    private const uint TOKEN_QUERY = 0x0008;
+
+    public static bool TestAdmin()
+    {
+        IntPtr hToken;
+        if (!NativeWin32.OpenProcessToken(NativeWin32.GetCurrentProcess(), TOKEN_QUERY, out hToken))
+            return false;
+        try
+        {
+            IntPtr elevation = Marshal.AllocHGlobal(4);
+            try
+            {
+                int retLen;
+                if (!NativeWin32.GetTokenInformation(hToken, TokenElevation, elevation, 4, out retLen))
+                    return false;
+                return Marshal.ReadInt32(elevation) != 0;
+            }
+            finally { Marshal.FreeHGlobal(elevation); }
+        }
+        finally { NativeWin32.CloseHandle(hToken); }
+    }
+
+    // ========== 发送到游戏窗口 ==========
+    public static void SendToGame(Hashtable sync, string sendData)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(sendData)) return;
+            string[] fields = sendData.Split(new[] { "||||" }, StringSplitOptions.None);
+            string sendContent = fields.Length >= 2 ? fields[1] : "";
+            bool inputBoxState = fields.Length >= 3 && fields[2] == "1";
+            string timestampField = fields.Length >= 5 ? fields[4] : "";
+            if (!string.IsNullOrEmpty(timestampField) && timestampField.Length >= 10)
+            {
+                long tsSec = long.Parse(timestampField.Substring(0, 10));
+                long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (Math.Abs(nowSec - tsSec) > 3) return;
+            }
+            string sendText;
+            try
+            {
+                byte[] sendBytes = Convert.FromBase64String(sendContent);
+                sendText = Encoding.UTF8.GetString(sendBytes);
+            }
+            catch { return; }
+            if (string.IsNullOrEmpty(sendText)) return;
+
+            IntPtr hwnd = NativeWin32.GetForegroundWindow();
+            var sbTitle = new StringBuilder(256);
+            var sbClass = new StringBuilder(256);
+            NativeWin32.GetWindowText(hwnd, sbTitle, 256);
+            NativeWin32.GetClassName(hwnd, sbClass, 256);
+            if (sbClass.ToString() != "ArcheAge" && !sbTitle.ToString().Contains("ArcheAge")) return;
+
+            byte[] bytes = Encoding.Unicode.GetBytes(sendText + "\0");
+            IntPtr hMem = NativeWin32.GlobalAlloc(0x0042, (UIntPtr)(ulong)bytes.Length);
+            if (hMem == IntPtr.Zero) return;
+            bool clipOpen = false;
+            try
+            {
+                IntPtr pMem = NativeWin32.GlobalLock(hMem);
+                if (pMem == IntPtr.Zero) return;
+                Marshal.Copy(bytes, 0, pMem, bytes.Length);
+                NativeWin32.GlobalUnlock(hMem);
+                for (int retry = 0; retry < 10; retry++)
+                {
+                    if (NativeWin32.OpenClipboard(IntPtr.Zero)) { clipOpen = true; break; }
+                    Thread.Sleep(50);
                 }
-
-                # 入队到自动翻译工作队列（Worker 空闲时自动取出翻译）
-                $sync.AutoWorkQueue.Enqueue($msg)
+                if (!clipOpen) return;
+                NativeWin32.EmptyClipboard();
+                NativeWin32.SetClipboardData(13, hMem);
+                NativeWin32.CloseClipboard();
+            }
+            finally
+            {
+                if (!clipOpen) NativeWin32.GlobalFree(hMem);
             }
 
-            # 打印所有 Runspace 传来的状态消息
-            while ($sync.StatusMessages.Count -gt 0) {
-                $msg = $sync.StatusMessages.Dequeue()
-                [System.Console]::WriteLine("$msg")
+            const uint WM_ACTIVATE = 0x0006;
+            const uint WM_KEYDOWN = 0x0100;
+            const uint WM_KEYUP = 0x0101;
+            const int VK_RETURN = 0x0D;
+            const int VK_CONTROL = 0x11;
+            const int VK_V = 0x56;
+            const int VK_SHIFT = 0x10;
+            // 激活窗口是否shift按键
+            NativeWin32.SendMessageA(hwnd, WM_ACTIVATE, IntPtr.Zero, IntPtr.Zero);
+            NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_SHIFT, IntPtr.Zero);
+            if (inputBoxState)
+            {
+                // 输入框状态为true.那么先关闭了再等待100ms
+                NativeWin32.SendMessageA(hwnd, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
+                NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
+                Thread.Sleep(100);
             }
-        } catch {
-            # 循环内异常 → 记录错误后继续运行
-            try { $sync.StatusMessages.Enqueue(("[MainThread:Error] $_")) } catch { $null = $_ }
+            Thread.Sleep(50);
+            //打开 输入框
+            NativeWin32.SendMessageA(hwnd, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
+            NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
+            Thread.Sleep(100);
+            //按下ctrl+v发送内容再释放ctrl+v
+            NativeWin32.SendMessageA(hwnd, WM_KEYDOWN, (IntPtr)VK_CONTROL, IntPtr.Zero);
+            NativeWin32.SendMessageA(hwnd, WM_KEYDOWN, (IntPtr)VK_V, IntPtr.Zero);
+            NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_V, IntPtr.Zero);
+            NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_CONTROL, IntPtr.Zero);
+            Thread.Sleep(30);
+            //按下enter发送内容
+            NativeWin32.SendMessageA(hwnd, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
+            NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
         }
-
-        try {
-            [System.Threading.Thread]::Sleep($mainLoopMs)
-        } catch {
-            try { $sync.StatusMessages.Enqueue(("[MainThread:SleepError] $_")) } catch { $null = $_ }
-        }
-    }
-} catch {
-    try { $sync.StatusMessages.Enqueue(("[MainThread:Fatal] $_")) } catch { $null = $_ }
-} finally {
-    # ============================================================
-    # 清理
-    # ============================================================
-    [System.Console]::WriteLine("`n[Cleanup] Stopping...")
-    $sync.StopFlag = $true
-
-    # 停止所有工作线程（文件监控 + 自动翻译 ×3 + 手动翻译 ×1）
-    try {
-        if ($fileMonitorPS) { $fileMonitorPS.Stop(); $fileMonitorPS.Dispose() }
-        if ($fileMonitorRS) { $fileMonitorRS.Close(); $fileMonitorRS.Dispose() }
-    } catch { $null = $_ }
-    if ($workers) {
-        foreach ($w in $workers) {
-            try {
-                if ($w.PS) { $w.PS.Stop(); $w.PS.Dispose() }
-                if ($w.RS) { $w.RS.Close(); $w.RS.Dispose() }
-            } catch { $null = $_ }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[SendToGame:Error] " + ex.Message);
         }
     }
 
-    try { [TrayManager]::Cleanup() } catch {$null = $_ }
+    // ========== 主线程 ==========
+    private static void MainProc(object state)
+    {
+        var sync = (Hashtable)state;
+        var cache = (Hashtable)sync["Cache"];
+        var autoQ = (Queue)sync["AutoWorkQueue"];
+        var pending = (ArrayList)sync["PendingMessages"];
 
-[System.Console]::WriteLine("")
-[System.Console]::WriteLine("=== Statistics ===")
-[System.Console]::WriteLine("Auto messages found: $($sync.AutoFound)")
-[System.Console]::WriteLine("Cache hits:          $($sync.AutoCached)")
-[System.Console]::WriteLine("Auto translations succeeded: $($sync.AutoSent)")
-[System.Console]::WriteLine("Auto skipped (no translation needed): $($sync.AutoSkipped)")
-[System.Console]::WriteLine("Manual translations succeeded: $($sync.ManualSent)")
-[System.Console]::WriteLine("Translation failures: $($sync.Failed)")
-[System.Console]::WriteLine("[Cleanup] Complete")
-    if ($script:appMutex) {
-        try { $script:appMutex.Dispose() } catch { $null = $_ }
+        while (!ShouldStop(sync))
+        {
+            // 1. 检查自动消息信号
+            try
+            {
+                if ((bool)sync["NewAutoReady"])
+                {
+                    string msg = (string)sync["NewAutoMessage"];
+                    sync["NewAutoReady"] = false;
+                    sync["NewAutoMessage"] = null;
+
+                    string[] fields = msg.Split(new[] { "||||" }, StringSplitOptions.None);
+                    string cacheKey = fields.Length >= 4 ? fields[3] : msg;
+
+                    lock (cache.SyncRoot)
+                    {
+                        if (cache.ContainsKey(cacheKey))
+                        {
+                            var entry = (Hashtable)cache[cacheKey];
+                            entry["hitCount"] = (int)entry["hitCount"] + 1;
+                            entry["lastHit"] = DateTime.Now;
+                            WriteCacheHit(sync, msg, entry);
+                        }
+                        else
+                        {
+                            string msgText = cacheKey;
+                            if (fields.Length >= 4) { try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); } catch { } }
+                            string targetLang = fields.Length >= 5 ? fields[4] : "en";
+                            if (string.IsNullOrEmpty(targetLang)) targetLang = "en";
+                            if (NeedTranslate(msgText, targetLang))
+                            {
+                                lock (sync.SyncRoot) { pending.Add(msg); }
+                                Console.WriteLine("[Auto:Cache] Add: {0}", msgText.Substring(0, Math.Min(50, msgText.Length)));
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("[ERR:AutoMsg] {0}: {1}", ex.GetType().Name, ex.Message); }
+
+            // 3. 检查发送游戏信号
+            try
+            {
+                if ((bool)sync["SendToGameReady"])
+                {
+                    sync["SendToGameReady"] = false;
+                    string sendData = (string)sync["SendResultContent"];
+                    sync["SendResultContent"] = null;
+                    SendToGame(sync, sendData);
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("[ERR:SendToGame] {0}: {1}", ex.GetType().Name, ex.Message); }
+
+            // 4. 处理待翻译数组
+            try
+            {
+                lock (sync.SyncRoot)
+                {
+                    while (pending.Count > 0)
+                    {
+                        string msg = (string)pending[0];
+                        pending.RemoveAt(0);
+
+                        string[] fields2 = msg.Split(new[] { "||||" }, StringSplitOptions.None);
+                        string cacheKey2 = fields2.Length >= 4 ? fields2[3] : msg;
+
+                        lock (cache.SyncRoot)
+                        {
+                            if (cache.ContainsKey(cacheKey2))
+                            {
+                                var entry = (Hashtable)cache[cacheKey2];
+                                entry["hitCount"] = (int)entry["hitCount"] + 1;
+                                entry["lastHit"] = DateTime.Now;
+                                WriteCacheHit(sync, msg, entry);
+                                continue;
+                            }
+                        }
+
+                        lock (autoQ.SyncRoot) { autoQ.Enqueue(msg); }
+                    }
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("[ERR:Pending] {0}: {1}", ex.GetType().Name, ex.Message); }
+
+            Thread.Sleep(50);
+        }
     }
 }
+
+'@ -ErrorAction SilentlyContinue
+
+mode con: cols=100 lines=30
+[CSharpWorkers]::Start()

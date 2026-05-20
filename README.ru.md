@@ -6,6 +6,8 @@
 
 Плагин перевода чата для ArcheAge (поддерживает китайский, английский и русский языки). Требуется запуск PowerShell-сервиса перевода.
 
+> **Требование к среде: Windows PowerShell 5.1** (встроен в систему, дополнительная установка не требуется).
+
 ## Использование
 
 ### 1. Запуск сервиса перевода
@@ -54,11 +56,12 @@
 ## Примечания
 
 - Проверенные модели: `glm-4-flash`, `deepseek-v4-flash`
-- При использовании других моделей с функцией Reasoning/Thinking необходимо добавить код отключения мышления в функцию `Invoke-ChatAPI` в файле `monitor_translation_v2.ps1` (около строки 508). Пример:
+- При использовании других моделей с функцией Reasoning/Thinking необходимо добавить код отключения мышления в функцию `Invoke-ChatAPI` в файле `monitor_translation_v2.ps1`. Пример:
 
-```powershell
-# Отключение мышления для моделей deepseek
-if ($model -like '*deepseek*') { $body.thinking = @{ type = "disabled" } }
+```csharp
+// Отключение мышления для моделей deepseek (встроено, показано для справки)
+if (model != null && model.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0)
+    body["thinking"] = new Hashtable { { "type", "disabled" } };
 ```
 
 ---

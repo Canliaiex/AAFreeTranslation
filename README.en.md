@@ -6,6 +6,8 @@
 
 ArcheAge chat translation addon (supports Chinese, English, Russian). Requires the PowerShell translation service to run.
 
+> **Runtime requirement: Windows PowerShell 5.1** (built-in, no additional installation required).
+
 ## Usage
 
 ### 1. Start the Translation Service
@@ -54,11 +56,12 @@ Avoid editing files manually. Use the settings window described above to configu
 ## Notes
 
 - Confirmed tested models: `glm-4-flash`, `deepseek-v4-flash`
-- If using other models with Reasoning/Thinking capabilities, add code to disable thinking in the `Invoke-ChatAPI` function in `monitor_translation_v2.ps1` (around line 508). Reference:
+- If using other models with Reasoning/Thinking capabilities, add code to disable thinking in the `Invoke-ChatAPI` function in `monitor_translation_v2.ps1`. Reference:
 
-```powershell
-# Disable thinking for deepseek models
-if ($model -like '*deepseek*') { $body.thinking = @{ type = "disabled" } }
+```csharp
+// Disable thinking for deepseek models (built-in, shown here for reference)
+if (model != null && model.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0)
+    body["thinking"] = new Hashtable { { "type", "disabled" } };
 ```
 
 ---
