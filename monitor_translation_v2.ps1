@@ -16,6 +16,7 @@ param ()
 # 单实例检测（在 try 内创建，确保 finally 能清理）
 
 # 初始化
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName "System.Web"
 Add-Type -AssemblyName "System.Web.Extensions"
@@ -404,7 +405,7 @@ public static class CSharpWorkers
     private static bool NeedTranslate(string text, string targetLang)
     {
         if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(targetLang)) return false;
-        text = text.Replace("@^", "").Replace("@&", "");
+        text = text.Replace("@#", "").Replace("@^", "").Replace("@&", "");
         if (text.Trim() == "") return false;
         bool hasLetter = false;
         foreach (char c in text)
@@ -821,12 +822,18 @@ public static class CSharpWorkers
                     continue;
                 }
 
-                // 提取物品链接和招募链接（保护特殊格式，防止被翻译破坏）
+                // 保护游戏变量 → 物品链接 → 招募链接（防止翻译破坏特殊格式）
+                string gameVarPattern = @"@[A-Z_]+\([^)]*\)(?:\|[a-zA-Z0-9]+)?";
+                var gameVars = new ArrayList();
+                var gameVarMatches = Regex.Matches(msgText, gameVarPattern);
+                foreach (Match m in gameVarMatches) gameVars.Add(m.Value);
+                string processText = Regex.Replace(msgText, gameVarPattern, "@#");
+
                 string itemLinkPattern = @"[|]?i\d+,[^,]*,[^,]*,[^;]*;";
                 var itemLinks = new ArrayList();
-                var itemMatches = Regex.Matches(msgText, itemLinkPattern);
+                var itemMatches = Regex.Matches(processText, itemLinkPattern);
                 foreach (Match m in itemMatches) itemLinks.Add(m.Value);
-                string processText = Regex.Replace(msgText, itemLinkPattern, "@^");
+                processText = Regex.Replace(processText, itemLinkPattern, "@^");
 
                 string recruitLinkPattern = @"\|.*?;";
                 var recruitLinks = new ArrayList();
@@ -922,7 +929,9 @@ public static class CSharpWorkers
 
                 if (!string.IsNullOrEmpty(translation))
                 {
-                    // 恢复物品链接和招募链接
+                    // 按序恢复：游戏变量 → 物品链接 → 招募链接
+                    for (int i = 0; i < gameVars.Count; i++)
+                        translation = Regex.Replace(translation, Regex.Escape("@#"), (string)gameVars[i]);
                     for (int i = 0; i < itemLinks.Count; i++)
                         translation = Regex.Replace(translation, Regex.Escape("@^"), (string)itemLinks[i]);
                     for (int i = 0; i < recruitLinks.Count; i++)
@@ -1342,11 +1351,8 @@ public static class CSharpWorkers
                             if (fields.Length >= 4) { try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); } catch { } }
                             string targetLang = fields.Length >= 5 ? fields[4] : "en";
                             if (string.IsNullOrEmpty(targetLang)) targetLang = "en";
-                            if (NeedTranslate(msgText, targetLang))
-                            {
-                                lock (sync.SyncRoot) { pending.Add(msg); }
-                                Console.WriteLine("[Auto:Cache] Add: {0}", msgText.Substring(0, Math.Min(50, msgText.Length)));
-                            }
+                            lock (sync.SyncRoot) { pending.Add(msg); }
+                            Console.WriteLine("[Auto:Pending] {0}", msgText.Substring(0, Math.Min(50, msgText.Length)));
                         }
                     }
                 }
