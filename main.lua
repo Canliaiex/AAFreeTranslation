@@ -136,7 +136,7 @@ local function sendDecoratedChatByChannel(message, sender, channel)
 	if tostring(sender):lower() == tostring(nPlayerName):lower():gsub("^%s*(.-)%s*$", "%1") then
 		return
 	end
-	local prefix = "[TR]"
+	local prefix = "[Tr]"
 	if tostring(channel) == "-3" then
 		-- 悄悄话 CMF_WHISPER
 		X2Chat:DispatchChatMessage(3, prefix .. "[" .. sender .. "]: 对你: " .. message)
