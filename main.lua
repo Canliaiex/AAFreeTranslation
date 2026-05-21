@@ -231,7 +231,7 @@ local function trReadResponseRaw()
 			api.File:Write(sendResultFile, tostring("||||" .. info[2] .. "||||" .. tostring(InputBoxState) .. "||||" .. settingsPage.GetLang() .. "||||" .. info[4] .. "||||"))
 
 		end
-		--api.File:Write(OutResponseFile, "")--情况1：翻译结果已写入文件，清空文件内容
+		api.File:Write(OutResponseFile, "")--情况1：翻译结果已写入文件，清空文件内容
 		return true
 	end
 	return nil

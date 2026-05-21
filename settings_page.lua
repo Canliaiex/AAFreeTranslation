@@ -429,6 +429,9 @@ function SETTINGS.Initialize()
     cancelBtn:AddAnchor("BOTTOMRIGHT", settingsWindow, -15, -15)
     cancelBtn:SetHandler("OnClick", function(self, arg)
         if arg ~= "LeftButton" then return end
+        if resetPending then
+            resetPending = false
+        end
         settingsWindow:Show(false)
     end)
     local okBtn = createButton(settingsWindow, "AAF_Btn_OK", Locale.en.ok, 70)
@@ -438,6 +441,7 @@ function SETTINGS.Initialize()
         if arg ~= "LeftButton" then return end
         saveEnabled()
         if resetPending then
+            resetPending = false
             SETTINGS.resetUIPos = true
         end
         settingsWindow:Show(false)
