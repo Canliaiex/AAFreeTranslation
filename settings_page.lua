@@ -298,9 +298,9 @@ end
 -- ============================================================
 function SETTINGS.Initialize()
     local settings = SETTINGS.ReadConfig()
-    if settings.enabled == nil then settings.enabled = 0 end
-    if settings.translateEngine == nil then settings.translateEngine = 0 end
-    if settings.launchInput == nil then settings.launchInput = 0 end
+    if settings.enabled == nil then settings.enabled = 1 end
+    if settings.translateEngine == nil then settings.translateEngine = 1 end
+    if settings.launchInput == nil then settings.launchInput = 1 end
     if settings.outputBaseURL == nil then settings.outputBaseURL = "https://open.bigmodel.cn/api/paas/v4/chat/completions" end
     if settings.outputApiKey == nil then settings.outputApiKey = "" end
     if settings.outputModelName == nil then settings.outputModelName = "GLM-4-Flash" end
@@ -511,6 +511,10 @@ function SETTINGS.ReadConfig()
         end
         return data
     end
+    -- config.ini 不存在，设默认值（开启自动翻译、显示手动翻译、Google引擎）
+    SETTINGS.enabled = 1
+    SETTINGS.translateEngine = 1
+    SETTINGS.launchInput = 1
     return {}
 end
 
