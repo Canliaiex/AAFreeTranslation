@@ -993,6 +993,19 @@ public static class CSharpWorkers
         public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern void CloseHandle(IntPtr hObject);
+        [DllImport("shell32.dll")]
+        public static extern int SHQueryUserNotificationState(out QUERY_USER_NOTIFICATION_STATE pquns);
+    }
+
+    public enum QUERY_USER_NOTIFICATION_STATE
+    {
+        NOT_PRESENT = 1,
+        BUSY = 2,
+        RUNNING_D3D_FULL_SCREEN = 3,
+        PRESENTATION_MODE = 4,
+        ACCEPTS_NOTIFICATIONS = 5,
+        QUIET_TIME = 6,
+        APP_IMMERSIVE = 7
     }
 
     // ========== 配置读取 ==========
@@ -1255,8 +1268,14 @@ public static class CSharpWorkers
             const int VK_CONTROL = 0x11;
             const int VK_V = 0x56;
             const int VK_SHIFT = 0x10;
-            // 激活窗口是否shift按键
-            NativeWin32.SendMessageA(hwnd, WM_ACTIVATE, IntPtr.Zero, IntPtr.Zero);
+            // 全屏独占模式下 DirectX 接管了输入，不需要发 WM_ACTIVATE 重置状态
+            QUERY_USER_NOTIFICATION_STATE nState;
+            bool isFullscreen = NativeWin32.SHQueryUserNotificationState(out nState) == 0
+                             && nState == QUERY_USER_NOTIFICATION_STATE.RUNNING_D3D_FULL_SCREEN;
+            if (!isFullscreen)
+            {
+                NativeWin32.SendMessageA(hwnd, WM_ACTIVATE, IntPtr.Zero, IntPtr.Zero);
+            }
             NativeWin32.SendMessageA(hwnd, WM_KEYUP, (IntPtr)VK_SHIFT, IntPtr.Zero);
             if (inputBoxState)
             {
