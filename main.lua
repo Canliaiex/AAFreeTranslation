@@ -122,7 +122,9 @@ local function writeChatToTranslatingFile(channel, unit, isHostile, name, messag
 	if name ~= nil and #message > 1 then
 		--if tostring(channel) == "3" then return end--屏蔽频道
 		--if tostring(channel) ~= "0" then return end--屏蔽其他频道进行测试
-		if name == playerName then return end--屏蔽自己发送
+		if tostring(channel) == "-4" then return end --屏蔽自己发送
+		local nPlayerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player")) --获取自身玩家名
+		if tostring(sender):lower() == tostring(nPlayerName):lower():gsub("^%s*(.-)%s*$", "%1") then return end --屏蔽自己发送
 		api.File:Write(chatSourceFile, tostring( "||||" .. channel .. "||||" .. name .. "||||" .. base64Encode(message) .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||"))
 	end
 end
@@ -130,11 +132,11 @@ end
 -- 聊天框显示自动翻译结果
 local function sendDecoratedChatByChannel(message, sender, channel)
 
-	local playerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
-	if tostring(sender):lower() == tostring(playerName):lower():gsub("^%s*(.-)%s*$", "%1") then
+	local nPlayerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
+	if tostring(sender):lower() == tostring(nPlayerName):lower():gsub("^%s*(.-)%s*$", "%1") then
 		return
 	end
-	local prefix = " "
+	local prefix = "[TR]"
 	if tostring(channel) == "-3" then
 		-- 悄悄话 CMF_WHISPER
 		X2Chat:DispatchChatMessage(3, prefix .. "[" .. sender .. "]: 对你: " .. message)
