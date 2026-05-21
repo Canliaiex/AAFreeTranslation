@@ -407,26 +407,26 @@ public static class CSharpWorkers
         if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(targetLang)) return false;
         text = text.Replace("@#", "").Replace("@^", "").Replace("@&", "");
         if (text.Trim() == "") return false;
-        bool hasLetter = false;
-        foreach (char c in text)
-        {
-            if (char.IsLetter(c)) { hasLetter = true; break; }
-        }
-        if (!hasLetter) return false;
-        int charCount = 0, enCount = 0, zhCount = 0, ruCount = 0;
+
+        int zhCount = 0, ruCount = 0, enCount = 0;
         foreach (char c in text)
         {
             int code = (int)c;
-            if      (code >= 0x4E00 && code <= 0x9FFF) { zhCount++; charCount++; }
-            else if (code >= 0x3400 && code <= 0x4DBF) { zhCount++; charCount++; }
-            else if (code >= 0x0400 && code <= 0x04FF) { ruCount++; charCount++; }
-            else if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) { enCount++; charCount++; }
+            if      (code >= 0x4E00 && code <= 0x9FFF) zhCount++;
+            else if (code >= 0x3400 && code <= 0x4DBF) zhCount++;
+            else if (code >= 0x0400 && code <= 0x04FF) ruCount++;
+            else if ((code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) enCount++;
         }
-        if (charCount == 0) return false;
+        if (zhCount + ruCount + enCount == 0) return false;
+
+        // 快速路径：目标是中文时，只要包含中文就不翻译
+        if (targetLang == "zh" && zhCount > 0) return false;
+
+        // 通用路径：判断主导语言
         string detectedLang = "en";
         int maxCount = enCount;
-        if (zhCount >= maxCount) { maxCount = zhCount; detectedLang = "zh"; }
-        if (ruCount >= maxCount) { maxCount = ruCount; detectedLang = "ru"; }
+        if (zhCount > maxCount) { maxCount = zhCount; detectedLang = "zh"; }
+        if (ruCount > maxCount) { maxCount = ruCount; detectedLang = "ru"; }
         return detectedLang != targetLang;
     }
 
@@ -1352,7 +1352,7 @@ public static class CSharpWorkers
                             string targetLang = fields.Length >= 5 ? fields[4] : "en";
                             if (string.IsNullOrEmpty(targetLang)) targetLang = "en";
                             lock (sync.SyncRoot) { pending.Add(msg); }
-                            Console.WriteLine("[Auto:Pending] {0}", msgText.Substring(0, Math.Min(50, msgText.Length)));
+                            //Console.WriteLine("[Auto:Pending] {0}", msgText.Substring(0, Math.Min(50, msgText.Length)));
                         }
                     }
                 }
