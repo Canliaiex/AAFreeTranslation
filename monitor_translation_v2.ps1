@@ -821,13 +821,6 @@ public static class CSharpWorkers
                     continue;
                 }
 
-                // 判断是否需要翻译
-                if (!NeedTranslate(msgText, targetLang))
-                {
-                    lock (sync.SyncRoot) { sync["AutoSkipped"] = (int)sync["AutoSkipped"] + 1; }
-                    continue;
-                }
-
                 // 提取物品链接和招募链接（保护特殊格式，防止被翻译破坏）
                 string itemLinkPattern = @"[|]?i\d+,[^,]*,[^,]*,[^;]*;";
                 var itemLinks = new ArrayList();
@@ -840,6 +833,13 @@ public static class CSharpWorkers
                 var recruitMatches = Regex.Matches(processText, recruitLinkPattern);
                 foreach (Match m in recruitMatches) recruitLinks.Add(m.Value);
                 processText = Regex.Replace(processText, recruitLinkPattern, "@&");
+
+                // 判断是否需要翻译（此时已去除物品/招募链接中的英文干扰）
+                if (!NeedTranslate(processText, targetLang))
+                {
+                    lock (sync.SyncRoot) { sync["AutoSkipped"] = (int)sync["AutoSkipped"] + 1; }
+                    continue;
+                }
 
                 // 调用翻译
                 string translation = null;

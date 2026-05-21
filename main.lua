@@ -112,7 +112,7 @@ local function GetTimestamp()
     while #secStr < 10 do
         secStr = "0" .. secStr
     end
-    result = secStr .. msecStr
+    local result = secStr .. msecStr
     return result
 end
 -- ============================================================
