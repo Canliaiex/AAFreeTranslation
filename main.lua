@@ -4,7 +4,7 @@ local settingsPage = require("AAFreeTranslation/settings_page")
 
 local AAFree_Translation_addon = {
 	name = "AAFreeTranslation",
-	author = "",
+	author = "Canliaiex",
 	version = "1.0",
 	desc = "Need Run AAFREE Translation Service First"
 }
@@ -33,8 +33,8 @@ local trOutputEdit
 local addonPath     = "AAFreeTranslation/"
 local InRequestFile  = addonPath .. "cache/manual_request"
 local OutResponseFile = addonPath .. "cache/manual_response"
-local chatSourceFile = addonPath .. "cache/chat_source"
-local chatResultFile = addonPath .. "cache/chat_result"
+local chatSourceFile = addonPath .. "cache/chat_source_"
+local chatResultFile = addonPath .. "cache/chat_result_"
 local sendResultFile = addonPath .. "cache/send_result"
 local dumpFile       = addonPath .. "dump.lua"
 
@@ -124,8 +124,9 @@ local function writeChatToTranslatingFile(channel, unit, isHostile, name, messag
 		--if tostring(channel) ~= "0" then return end--屏蔽其他频道进行测试
 		if tostring(channel) == "-4" then return end --屏蔽自己发送
 		local nPlayerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player")) --获取自身玩家名
-		if tostring(sender):lower() == tostring(nPlayerName):lower():gsub("^%s*(.-)%s*$", "%1") then return end --屏蔽自己发送
-		api.File:Write(chatSourceFile, tostring( "||||" .. channel .. "||||" .. name .. "||||" .. base64Encode(message) .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||"))
+		if tostring(name):lower() == tostring(nPlayerName):lower():gsub("^%s*(.-)%s*$", "%1") then return end --屏蔽自己发送
+		local playerid = tonumber(api.Unit:GetUnitId("player"),16)--根据玩家id写入翻译请求文件
+		api.File:Write(chatSourceFile .. tostring(playerid), tostring( "||||" .. channel .. "||||" .. name .. "||||" .. base64Encode(message) .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||" .. tostring(playerid) .. "||||"))
 	end
 end
 
@@ -176,21 +177,24 @@ local function sendDecoratedChatByChannel(message, sender, channel)
 	elseif tostring(channel) == "14" then
 		-- 势力 CMF_FACTION
 		X2Chat:DispatchChatMessage(56, "|cFFfcfc01" .. prefix .. "[" .. sender .. "]: " .. message)
+	elseif tostring(channel) == "-2" then
+		--系统频道
+		X2Chat:DispatchChatMessage(56, prefix .. message)
+	else
+		-- 未知频道，默认输出
+		X2Chat:DispatchChatMessage(56, "" .. prefix .. "[chid:" .. tostring(channel) .. "]:" .. message)
 	end
 end
 
 -- 读取自动翻译结果
 local lastMsgTime = ""
 local function readLatestTranslatedMessage()
-	local data = api.File:Read(chatResultFile)
+	local playerid = tonumber(api.Unit:GetUnitId("player"),16)--根据玩家id读取翻译结果
+	local data = api.File:Read(chatResultFile .. tostring(playerid))
 	if not data or not data.chatMsg then return end
 	local msg = data.chatMsg
 	local info = split(msg, "||||")
 	if not info[4] then return end -- 无时间戳返回
-	if lastMsgTime == "" then -- 初始化时间
-		lastMsgTime = info[4]
-		return
-	end
 	if lastMsgTime ~= info[4] then -- 时间戳不同 更新时间然后显示到消息里面
 		lastMsgTime = info[4]
 	else
@@ -258,7 +262,7 @@ local function trDoTranslate()
 	end
 	local input = trInputEdit:GetText()
 	if not input or input == "" then
-		trOutputEdit:SetOutputText("输入为空")
+		trOutputEdit:SetOutputText("Input is empty")
 		return
 	end
 	local ShiftState= api.Input:IsShiftKeyDown()
@@ -267,7 +271,7 @@ local function trDoTranslate()
 	trMainWindow:Show(true)
 	end
 	trSendRequest(input, ShiftState)
-	trOutputEdit:SetOutputText("翻译中...")
+	trOutputEdit:SetOutputText("Working...")
 end
 
 --翻译结果编辑框只读函数
@@ -532,6 +536,11 @@ local function OnLoad()
 	playerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
 	CreateTranslatorUI()
 	CreateTranslationWindow()
+
+	-- 加载时清空上次的缓存数据
+	local pid = tostring(tonumber(api.Unit:GetUnitId("player"), 16))
+	api.File:Write(chatSourceFile .. pid, "")
+	api.File:Write(chatResultFile .. pid, "")
 
 	api.On("UPDATE", OnUpdate)
 	settingsPage.Initialize()
