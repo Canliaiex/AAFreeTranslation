@@ -164,7 +164,6 @@ public static class CSharpWorkers
     private static readonly Thread[] _autoWorkerThreads = new Thread[3];
     private static readonly HttpClient _http = new HttpClient();
     private static readonly Hashtable _fileWriteLocks = new Hashtable();
-    private static readonly Hashtable _fileLastWrites = new Hashtable();
     private static readonly object _fileLockRoot = new object();
 
     public static void StartAll(Hashtable sync)
@@ -198,7 +197,7 @@ public static class CSharpWorkers
         // 启动信息
         Console.WriteLine("");
         Console.WriteLine("=== Running ===");
-        Console.WriteLine("Auto messages: {0}", sync["AutoFilePath"]);
+        Console.WriteLine("Auto messages: {0}", ".\\cache");
         Console.WriteLine("Manual requests: {0}", sync["RequestFilePath"]);
         Console.WriteLine("Input model (manual): {0}", sync["InputModel"]);
         Console.WriteLine("Input endpoint: {0}", sync["InputEndpoint"]);
@@ -289,42 +288,7 @@ public static class CSharpWorkers
         }
     }
 
-    private static void WriteChatResultLocked(string path, string content)
-    {
-        object fileLock;
-        lock (_fileLockRoot)
-        {
-            fileLock = _fileWriteLocks[path];
-            if (fileLock == null)
-            {
-                fileLock = new object();
-                _fileWriteLocks[path] = fileLock;
-            }
-        }
-        lock (fileLock)
-        {
-            int waitMs = 0;
-            lock (_fileLockRoot)
-            {
-                object last = _fileLastWrites[path];
-                if (last != null)
-                    waitMs = 100 - (int)(DateTime.Now - (DateTime)last).TotalMilliseconds;
-            }
-            if (waitMs > 0) Thread.Sleep(waitMs);
-
-            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                byte[] data = Encoding.UTF8.GetBytes(content);
-                fs.Write(data, 0, data.Length);
-            }
-            lock (_fileLockRoot)
-            {
-                _fileLastWrites[path] = DateTime.Now;
-            }
-        }
-    }
-
-    private static string ReadLuaFile(string path)
+    private static string ReadLuaFile(string path, int minFields)
     {
         try
         {
@@ -335,7 +299,7 @@ public static class CSharpWorkers
             if (m.Success) raw = m.Groups[1].Value.Trim();
             if (!raw.StartsWith("||||") || !raw.EndsWith("||||")) return "";
             string[] parts = raw.Split(new[] { "||||" }, StringSplitOptions.None);
-            if (parts.Length < 6) return "";
+            if (parts.Length != minFields) return "";
             return raw;
         }
         catch { return ""; }
@@ -401,6 +365,44 @@ public static class CSharpWorkers
         }
     }
 
+    // ========== 标记提取/还原（游戏变量、物品链接、招募链接）==========
+    private class MarkupData
+    {
+        public string ProcessText;
+        public ArrayList GameVars = new ArrayList();
+        public ArrayList ItemLinks = new ArrayList();
+        public ArrayList RecruitLinks = new ArrayList();
+
+        public string Restore(string text)
+        {
+            for (int i = 0; i < GameVars.Count; i++)
+                text = Regex.Replace(text, Regex.Escape("@#"), (string)GameVars[i]);
+            for (int i = 0; i < ItemLinks.Count; i++)
+                text = Regex.Replace(text, Regex.Escape("@^"), (string)ItemLinks[i]);
+            for (int i = 0; i < RecruitLinks.Count; i++)
+                text = Regex.Replace(text, Regex.Escape("@&"), (string)RecruitLinks[i]);
+            return text;
+        }
+    }
+
+    private static void ExtractMarkups(string msgText, MarkupData md)
+    {
+        string gameVarPattern = @"@[A-Z_]+\([^)]*\)(?:\|[a-zA-Z0-9]+)?";
+        var gameVarMatches = Regex.Matches(msgText, gameVarPattern);
+        foreach (Match m in gameVarMatches) md.GameVars.Add(m.Value);
+        md.ProcessText = Regex.Replace(msgText, gameVarPattern, "@#");
+
+        string itemLinkPattern = @"[|]?i\d+,[^,]*,[^,]*,[^;]*;";
+        var itemMatches = Regex.Matches(md.ProcessText, itemLinkPattern);
+        foreach (Match m in itemMatches) md.ItemLinks.Add(m.Value);
+        md.ProcessText = Regex.Replace(md.ProcessText, itemLinkPattern, "@^");
+
+        string recruitLinkPattern = @"\|.*?;";
+        var recruitMatches = Regex.Matches(md.ProcessText, recruitLinkPattern);
+        foreach (Match m in recruitMatches) md.RecruitLinks.Add(m.Value);
+        md.ProcessText = Regex.Replace(md.ProcessText, recruitLinkPattern, "@&");
+    }
+
     // ========== 语言检测 ==========
     private static bool NeedTranslate(string text, string targetLang)
     {
@@ -445,7 +447,14 @@ public static class CSharpWorkers
             {
                 string json = reader.ReadToEnd();
                 var match = Regex.Match(json, @"\[\[\[""([^""]*)""");
-                if (match.Success) return match.Groups[1].Value;
+                if (match.Success)
+                {
+                    string raw = match.Groups[1].Value;
+                    // 解码 Google 返回的 \uXXXX 转义
+                    return Regex.Replace(raw, @"\\u([0-9a-fA-F]{4})",
+                        m => ((char)int.Parse(m.Groups[1].Value,
+                            System.Globalization.NumberStyles.HexNumber)).ToString());
+                }
             }
             return "";
         }
@@ -539,12 +548,12 @@ public static class CSharpWorkers
     {
         var sync = (Hashtable)state;
         var manualQ = (Queue)sync["ManualWorkQueue"];
-        string lastManual = ReadLuaFile((string)sync["RequestFilePath"]);
-        string lastAuto = ReadLuaFile((string)sync["AutoFilePath"]);
-        string lastSend = ReadLuaFile((string)sync["SendResultFile"]);
+
+        // 初始化：读取当前内容，避免启动时误触发
+        string lastManual = ReadLuaFile((string)sync["RequestFilePath"], 6);
+        string lastSend = ReadLuaFile((string)sync["SendResultFile"], 6);
         DateTime lastSendTime = DateTime.MinValue;
-        DateTime lastConfigTime = DateTime.MinValue;
-        try { lastConfigTime = File.GetLastWriteTime((string)sync["ConfigFilePath"]); } catch { }
+        var autoFileStates = new Dictionary<string, string>();  // 跟踪每个 chat_source_* 文件的内容
 
         // 启动时清理 send_result 残留，防止发脏数据到游戏
         try
@@ -555,69 +564,53 @@ public static class CSharpWorkers
         }
         catch { }
 
-        while (!ShouldStop(sync))
+        // 启动时清理残留的 per-client 文件
+        try
+        {
+            foreach (var f in Directory.GetFiles((string)sync["CacheDir"], "chat_source_*"))
+            {
+                var m = Regex.Match(Path.GetFileName(f), @"^chat_source_(\d+)$");
+                if (m.Success) File.Delete(f);
+            }
+            foreach (var f in Directory.GetFiles((string)sync["CacheDir"], "chat_result_*"))
+            {
+                var m = Regex.Match(Path.GetFileName(f), @"^chat_result_(\d+)$");
+                if (m.Success) File.Delete(f);
+            }
+        }
+        catch { }
+
+        // 创建 FileSystemWatcher，监控 cache 目录
+        var watcher = new FileSystemWatcher((string)sync["CacheDir"]);
+        watcher.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName;
+        Action<FileSystemEventArgs> onFileEvent = e =>
         {
             try
             {
-                // ---- config.ini 热重载 ----
-                try
+                string fullPath = e.FullPath;
+                string name = Path.GetFileName(e.Name);
+
+                // ---- chat_source_* 检查 ----
+                if (name.StartsWith("chat_source_"))
                 {
-                    DateTime cfgTime = File.GetLastWriteTime((string)sync["ConfigFilePath"]);
-                    if (cfgTime != lastConfigTime)
+                    string content = ReadLuaFile(fullPath, 8);
+                    if (string.IsNullOrEmpty(content)) return;
+
+                    lock (autoFileStates)
                     {
-                        lastConfigTime = cfgTime;
-                        ReadConfig(sync);
+                        string lastContent = autoFileStates.ContainsKey(fullPath) ? autoFileStates[fullPath] : null;
+                        if (content == lastContent) return;
+                        autoFileStates[fullPath] = content;
                     }
-                }
-                catch { }
 
-                // ---- SendResult 检查 ----
-                string sendFile = (string)sync["SendResultFile"];
-                string sendContent = ReadLuaFile(sendFile);
-                if (!string.IsNullOrEmpty(sendContent) && sendContent != lastSend)
-                {
-                    lastSend = sendContent;
-                    if ((bool)sync["IsAdmin"])
-                    {
-                        WriteFileLocked(sendFile, "");
-                        var now = DateTime.Now;
-                        if ((now - lastSendTime).TotalMilliseconds >= 30)
-                        {
-                            lastSendTime = now;
-                            lock (sync.SyncRoot)
-                            {
-                                sync["SendResultContent"] = sendContent;
-                                sync["SendToGameReady"] = true;
-                            }
-                        }
-                    }
-                }
-
-                // ---- manual_request 检查 ----
-                string reqFile = (string)sync["RequestFilePath"];
-                string reqContent = ReadLuaFile(reqFile);
-                if (!string.IsNullOrEmpty(reqContent) && reqContent != lastManual)
-                {
-                    lastManual = reqContent;
-                    lock (manualQ.SyncRoot) { manualQ.Enqueue(reqContent); }
-                }
-
-                // ---- chat_source 检查 ----
-                string autoFile = (string)sync["AutoFilePath"];
-                string autoContent = ReadLuaFile(autoFile);
-                if (!string.IsNullOrEmpty(autoContent) && autoContent != lastAuto)
-                {
-                    lastAuto = autoContent;
-                    autoContent = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(autoContent));
                     lock (sync.SyncRoot)
                     {
-                        sync["NewAutoMessage"] = autoContent;
-                        sync["NewAutoReady"] = true;
+                        ((Queue)sync["NewAutoQueue"]).Enqueue(content);
                         sync["AutoFound"] = (int)sync["AutoFound"] + 1;
                     }
                     try
                     {
-                        string[] fs = autoContent.Split(new[] { "||||" }, StringSplitOptions.None);
+                        string[] fs = content.Split(new[] { "||||" }, StringSplitOptions.None);
                         string sender = fs.Length >= 3 ? fs[2] : "";
                         string rawText = "";
                         if (fs.Length >= 4) try { rawText = Encoding.UTF8.GetString(Convert.FromBase64String(fs[3])); } catch { rawText = fs[3]; }
@@ -628,14 +621,66 @@ public static class CSharpWorkers
                         Console.WriteLine("[Auto:NewMsg] {0}:{1}", sender, disp);
                     }
                     catch { }
+                    return;
+                }
+
+                // ---- SendResult 检查 ----
+                if (name == "send_result")
+                {
+                    string sendFile = (string)sync["SendResultFile"];
+                    string sendContent = ReadLuaFile(sendFile, 6);
+                    if (!string.IsNullOrEmpty(sendContent) && sendContent != lastSend)
+                    {
+                        lastSend = sendContent;
+                        if ((bool)sync["IsAdmin"])
+                        {
+                            WriteFileLocked(sendFile, "");
+                            var now2 = DateTime.Now;
+                            if ((now2 - lastSendTime).TotalMilliseconds >= 30)
+                            {
+                                lastSendTime = now2;
+                                lock (sync.SyncRoot)
+                                {
+                                    sync["SendResultContent"] = sendContent;
+                                    sync["SendToGameReady"] = true;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // ---- manual_request 检查 ----
+                if (name == "manual_request")
+                {
+                    string reqFile = (string)sync["RequestFilePath"];
+                    string reqContent = ReadLuaFile(reqFile, 6);
+                    if (!string.IsNullOrEmpty(reqContent) && reqContent != lastManual)
+                    {
+                        lastManual = reqContent;
+                        lock (manualQ.SyncRoot) { manualQ.Enqueue(reqContent); }
+                    }
+                    return;
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[FileMonitor:Error] " + ex.Message);
+                Console.WriteLine("[FileWatcher:Error] " + ex.Message);
             }
-            Thread.Sleep(50);
+        };
+        watcher.Changed += (s, e) => onFileEvent(e);
+        watcher.Created += (s, e) => onFileEvent(e);
+        watcher.EnableRaisingEvents = true;
+        Console.WriteLine("[FileWatcher] Monitoring: {0}", ".\\cache");
+
+        // 保持线程存活
+        while (!ShouldStop(sync))
+        {
+            Thread.Sleep(1000);
         }
+
+        watcher.EnableRaisingEvents = false;
+        watcher.Dispose();
     }
 
     // ========== 手动翻译 Worker ==========
@@ -747,8 +792,7 @@ public static class CSharpWorkers
                 // 输出结果
                 if (!string.IsNullOrEmpty(result))
                 {
-                    string utf8Result = Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(result));
-                    string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(utf8Result));
+                    string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(result));
                     string origB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(msgText));
                     string output = "{chatMsg = \"||||" + playerName + "||||" + b64 + "||||" + origB64 + "||||" + timestamp + "||||\"}";
 
@@ -765,9 +809,6 @@ public static class CSharpWorkers
                 {
                     lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
                     Console.WriteLine("[Input:Error]");
-                    string errB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes("[Error]"));
-                    string errOut = "{chatMsg = \"||||" + playerName + "||||" + errB64 + "||||" + timestamp + "||||\"}";
-                    WriteFileLocked((string)sync["ManualOutFile"], errOut);
                 }
             }
             catch (Exception ex)
@@ -798,6 +839,7 @@ public static class CSharpWorkers
             }
             if (content == null) { Thread.Sleep(50); continue; }
 
+            string cacheKey = null;
             try
             {
                 // 解析字段
@@ -813,36 +855,13 @@ public static class CSharpWorkers
                     catch { msgText = fields[3]; }
                 }
 
-                // 查缓存
-                string cacheKey = fields.Length >= 4 ? fields[3] : content;
-                string cached = GetCache(cache, cacheKey);
-                if (cached != null)
-                {
-                    lock (sync.SyncRoot) { sync["AutoCached"] = (int)sync["AutoCached"] + 1; }
-                    continue;
-                }
-
-                // 保护游戏变量 → 物品链接 → 招募链接（防止翻译破坏特殊格式）
-                string gameVarPattern = @"@[A-Z_]+\([^)]*\)(?:\|[a-zA-Z0-9]+)?";
-                var gameVars = new ArrayList();
-                var gameVarMatches = Regex.Matches(msgText, gameVarPattern);
-                foreach (Match m in gameVarMatches) gameVars.Add(m.Value);
-                string processText = Regex.Replace(msgText, gameVarPattern, "@#");
-
-                string itemLinkPattern = @"[|]?i\d+,[^,]*,[^,]*,[^;]*;";
-                var itemLinks = new ArrayList();
-                var itemMatches = Regex.Matches(processText, itemLinkPattern);
-                foreach (Match m in itemMatches) itemLinks.Add(m.Value);
-                processText = Regex.Replace(processText, itemLinkPattern, "@^");
-
-                string recruitLinkPattern = @"\|.*?;";
-                var recruitLinks = new ArrayList();
-                var recruitMatches = Regex.Matches(processText, recruitLinkPattern);
-                foreach (Match m in recruitMatches) recruitLinks.Add(m.Value);
-                processText = Regex.Replace(processText, recruitLinkPattern, "@&");
+                // 提取占位符（MainProc 已处理缓存/PendingKey，这里只管翻译）
+                var md = new MarkupData();
+                ExtractMarkups(msgText, md);
+                cacheKey = md.ProcessText;
 
                 // 判断是否需要翻译（此时已去除物品/招募链接中的英文干扰）
-                if (!NeedTranslate(processText, targetLang))
+                if (!NeedTranslate(md.ProcessText, targetLang))
                 {
                     lock (sync.SyncRoot) { sync["AutoSkipped"] = (int)sync["AutoSkipped"] + 1; }
                     continue;
@@ -857,7 +876,7 @@ public static class CSharpWorkers
 
                 if (engine == 1)
                 {
-                    translation = InvokeGoogleTranslate(tmo, targetLang, processText);
+                    translation = InvokeGoogleTranslate(tmo, targetLang, md.ProcessText);
                 }
                 else if (engine == 2)
                 {
@@ -890,9 +909,9 @@ public static class CSharpWorkers
                             msgs2.Add(new Hashtable { { "role", "assistant" }, { "content", ex["assistant"] } });
                         }
                     }
-                    string wrapped = processText;
+                    string wrapped = md.ProcessText;
                     if (autoCfg != null && autoCfg.Contains("wrap"))
-                        wrapped = ((string)autoCfg["wrap"]).Replace("{text}", processText);
+                        wrapped = ((string)autoCfg["wrap"]).Replace("{text}", md.ProcessText);
                     msgs2.Add(new Hashtable { { "role", "user" }, { "content", wrapped } });
 
                     config2 = new Hashtable();
@@ -915,7 +934,7 @@ public static class CSharpWorkers
                     Thread.Sleep(1000);
                     if (engine == 1)
                     {
-                        translation = InvokeGoogleTranslate(tmo, targetLang, processText);
+                        translation = InvokeGoogleTranslate(tmo, targetLang, md.ProcessText);
                     }
                     else if (engine == 2)
                     {
@@ -929,25 +948,25 @@ public static class CSharpWorkers
 
                 if (!string.IsNullOrEmpty(translation))
                 {
+                    // 入缓存（存带占位符的版本，下次不同链接 ID 也能命中）
+                    SetCache(cache, cmax, cacheKey, translation);
+
                     // 按序恢复：游戏变量 → 物品链接 → 招募链接
-                    for (int i = 0; i < gameVars.Count; i++)
-                        translation = Regex.Replace(translation, Regex.Escape("@#"), (string)gameVars[i]);
-                    for (int i = 0; i < itemLinks.Count; i++)
-                        translation = Regex.Replace(translation, Regex.Escape("@^"), (string)itemLinks[i]);
-                    for (int i = 0; i < recruitLinks.Count; i++)
-                        translation = Regex.Replace(translation, Regex.Escape("@&"), (string)recruitLinks[i]);
+                    translation = md.Restore(translation);
                     translation = translation.Replace("<", "").Replace(">", "").Replace("[", "").Replace("]", "");
                     // 写文件
                     string prefix = "||||" + channel + "||||" + senderName + "||||";
                     string tB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(translation));
                     string ts = fields.Length >= 6 ? fields[5] : "";
                     string logEntry = "{chatMsg = \"" + prefix + tB64 + "||||" + ts + "||||\"}";
-                    WriteChatResultLocked((string)sync["AutoOutFile"], logEntry);
+                    string pid = fields.Length >= 7 ? fields[6] : "";
+                    string outPath = Path.Combine((string)sync["CacheDir"], "chat_result_" + pid);
+                    WriteFileLocked(outPath, logEntry);
 
                     lock (sync.SyncRoot) { sync["AutoSent"] = (int)sync["AutoSent"] + 1; }
 
-                    // 入缓存
-                    SetCache(cache, cmax, cacheKey, translation);
+                    // 写出结果给所有等待此消息的客户端
+                    lock (sync.SyncRoot) { FlushPendingKey(sync, cacheKey); }
 
                     string disp = translation;
                     Console.WriteLine("[Auto#{0}:Done] {1}:{2}", wid, senderName,
@@ -955,13 +974,13 @@ public static class CSharpWorkers
                 }
                 else
                 {
-                    lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
+                    lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; RemovePendingKey(sync, cacheKey); }
                     Console.WriteLine("[Auto#" + wid + ":Error]");
                 }
             }
             catch (Exception ex)
             {
-                lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; }
+                lock (sync.SyncRoot) { sync["Failed"] = (int)sync["Failed"] + 1; RemovePendingKey(sync, cacheKey); }
                 Console.WriteLine("[Auto#" + wid + ":Error] " + ex.Message);
             }
         }
@@ -1082,19 +1101,19 @@ public static class CSharpWorkers
 
         // 数据字段
         sync["StopFlag"] = false;
-        sync["NewAutoMessage"] = null;
-        sync["NewAutoReady"] = false;
+        sync["NewAutoQueue"] = Queue.Synchronized(new Queue());
         sync["PendingMessages"] = ArrayList.Synchronized(new ArrayList());
         sync["Cache"] = Hashtable.Synchronized(new Hashtable());
         sync["CacheMaxSize"] = 100;
         sync["AutoWorkQueue"] = Queue.Synchronized(new Queue());
         sync["ManualWorkQueue"] = Queue.Synchronized(new Queue());
+        sync["PendingKeys"] = new Dictionary<string, ArrayList>();
 
         // 文件路径
-        sync["AutoFilePath"] = ".\\cache\\chat_source";
+        sync["CacheDir"] = Path.GetFullPath(".\\cache");
         sync["RequestFilePath"] = ".\\cache\\manual_request";
         sync["ManualOutFile"] = ".\\cache\\manual_response";
-        sync["AutoOutFile"] = Path.GetFullPath(".\\cache\\chat_result");
+
         sync["ConfigFilePath"] = Path.GetFullPath(".\\config.ini");
         sync["SendResultFile"] = Path.GetFullPath(".\\cache\\send_result");
 
@@ -1175,11 +1194,23 @@ public static class CSharpWorkers
             string[] fields = msg.Split(new[] { "||||" }, StringSplitOptions.None);
             string channel = fields.Length >= 2 ? fields[1] : "";
             string sender = fields.Length >= 3 ? fields[2] : "";
+            // 缓存存的是带占位符的版本，需要还原
             string translation = (string)entry["translation"];
+            if (fields.Length >= 4)
+            {
+                string msgText = null;
+                try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); }
+                catch { msgText = fields[3]; }
+                var md = new MarkupData();
+                ExtractMarkups(msgText, md);
+                translation = md.Restore(translation);
+            }
             string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(translation));
             string ts = fields.Length >= 6 ? fields[5] : "";
             string output = "{chatMsg = \"||||" + channel + "||||" + sender + "||||" + b64 + "||||" + ts + "||||\"}";
-            WriteChatResultLocked((string)sync["AutoOutFile"], output);
+            string playerId = fields.Length >= 7 ? fields[6] : "";
+            string resultPath = Path.Combine((string)sync["CacheDir"], "chat_result_" + playerId);
+            WriteFileLocked(resultPath, output);
             lock (sync.SyncRoot) { sync["AutoCached"] = (int)sync["AutoCached"] + 1; }
             Console.WriteLine("[Auto:Cache] " + translation.Substring(0, Math.Min(50, translation.Length)));
         }
@@ -1314,6 +1345,48 @@ public static class CSharpWorkers
         }
     }
 
+    // ========== 待翻译缓存管理 ==========
+    // 注册消息到待翻译缓存，返回 true=首次注册（需入队），false=已在等待中
+    private static bool TryRegisterPendingKey(Hashtable sync, string cacheKey, string msg)
+    {
+        var pendingKeys = (Dictionary<string, ArrayList>)sync["PendingKeys"];
+        ArrayList list;
+        if (pendingKeys.TryGetValue(cacheKey, out list))
+        {
+            list.Add(msg);
+            return false;
+        }
+        list = new ArrayList();
+        list.Add(msg);
+        pendingKeys[cacheKey] = list;
+        return true;
+    }
+
+    // 翻译完成，将翻译结果写出给所有等待此 cacheKey 的客户端
+    private static void FlushPendingKey(Hashtable sync, string cacheKey)
+    {
+        var pendingKeys = (Dictionary<string, ArrayList>)sync["PendingKeys"];
+        ArrayList list;
+        if (!pendingKeys.TryGetValue(cacheKey, out list)) return;
+        pendingKeys.Remove(cacheKey);
+
+        var cache = (Hashtable)sync["Cache"];
+        var entry = (Hashtable)cache[cacheKey];
+        if (entry == null) return;
+
+        foreach (string msg in list)
+        {
+            WriteCacheHit(sync, msg, entry);
+        }
+    }
+
+    // 翻译失败，清理待翻译缓存，允许后续重试
+    private static void RemovePendingKey(Hashtable sync, string cacheKey)
+    {
+        var pendingKeys = (Dictionary<string, ArrayList>)sync["PendingKeys"];
+        pendingKeys.Remove(cacheKey);
+    }
+
     // ========== 主线程 ==========
     private static void MainProc(object state)
     {
@@ -1322,19 +1395,49 @@ public static class CSharpWorkers
         var autoQ = (Queue)sync["AutoWorkQueue"];
         var pending = (ArrayList)sync["PendingMessages"];
 
+        // 记录 config.ini 最后修改时间，用于热重载
+        string configPath = (string)sync["ConfigFilePath"];
+        DateTime lastCfgTime = File.GetLastWriteTimeUtc(configPath);
+        DateTime lastCfgCheck = DateTime.UtcNow;
+
         while (!ShouldStop(sync))
         {
-            // 1. 检查自动消息信号
+            // 每秒检查 config.ini 是否更新
+            DateTime now = DateTime.UtcNow;
+            if ((now - lastCfgCheck).TotalSeconds >= 1.0)
+            {
+                lastCfgCheck = now;
+                try
+                {
+                    DateTime newTime = File.GetLastWriteTimeUtc(configPath);
+                    if (newTime != lastCfgTime)
+                    {
+                        lastCfgTime = newTime;
+                        ReadConfig(sync);
+                    }
+                }
+                catch { }
+            }
+            // 1. 处理自动消息队列
             try
             {
-                if ((bool)sync["NewAutoReady"])
+                var autoQueue = (Queue)sync["NewAutoQueue"];
+                while (autoQueue.Count > 0)
                 {
-                    string msg = (string)sync["NewAutoMessage"];
-                    sync["NewAutoReady"] = false;
-                    sync["NewAutoMessage"] = null;
+                    string msg = (string)autoQueue.Dequeue();
 
                     string[] fields = msg.Split(new[] { "||||" }, StringSplitOptions.None);
-                    string cacheKey = fields.Length >= 4 ? fields[3] : msg;
+                    // 解码后用占位符文本做 key，与 AutoWorker 保持一致
+                    string cacheKey = msg;
+                    if (fields.Length >= 4)
+                    {
+                        string msgText = null;
+                        try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); }
+                        catch { msgText = fields[3]; }
+                        var md = new MarkupData();
+                        ExtractMarkups(msgText, md);
+                        cacheKey = md.ProcessText;
+                    }
 
                     lock (cache.SyncRoot)
                     {
@@ -1347,12 +1450,11 @@ public static class CSharpWorkers
                         }
                         else
                         {
-                            string msgText = cacheKey;
-                            if (fields.Length >= 4) { try { msgText = Encoding.UTF8.GetString(Convert.FromBase64String(fields[3])); } catch { } }
-                            string targetLang = fields.Length >= 5 ? fields[4] : "en";
-                            if (string.IsNullOrEmpty(targetLang)) targetLang = "en";
-                            lock (sync.SyncRoot) { pending.Add(msg); }
-                            //Console.WriteLine("[Auto:Pending] {0}", msgText.Substring(0, Math.Min(50, msgText.Length)));
+                            lock (sync.SyncRoot)
+                            {
+                                if (TryRegisterPendingKey(sync, cacheKey, msg))
+                                    pending.Add(msg);
+                            }
                         }
                     }
                 }
@@ -1372,7 +1474,7 @@ public static class CSharpWorkers
             }
             catch (Exception ex) { Console.WriteLine("[ERR:SendToGame] {0}: {1}", ex.GetType().Name, ex.Message); }
 
-            // 4. 处理待翻译数组
+            // 4. 处理待翻译数组（MainProc 已确认缓存 miss + PendingKey，直接入队）
             try
             {
                 lock (sync.SyncRoot)
@@ -1381,22 +1483,6 @@ public static class CSharpWorkers
                     {
                         string msg = (string)pending[0];
                         pending.RemoveAt(0);
-
-                        string[] fields2 = msg.Split(new[] { "||||" }, StringSplitOptions.None);
-                        string cacheKey2 = fields2.Length >= 4 ? fields2[3] : msg;
-
-                        lock (cache.SyncRoot)
-                        {
-                            if (cache.ContainsKey(cacheKey2))
-                            {
-                                var entry = (Hashtable)cache[cacheKey2];
-                                entry["hitCount"] = (int)entry["hitCount"] + 1;
-                                entry["lastHit"] = DateTime.Now;
-                                WriteCacheHit(sync, msg, entry);
-                                continue;
-                            }
-                        }
-
                         lock (autoQ.SyncRoot) { autoQ.Enqueue(msg); }
                     }
                 }
