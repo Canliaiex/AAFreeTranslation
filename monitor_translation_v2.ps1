@@ -954,18 +954,9 @@ public static class CSharpWorkers
                     // 按序恢复：游戏变量 → 物品链接 → 招募链接
                     translation = md.Restore(translation);
                     translation = translation.Replace("<", "").Replace(">", "").Replace("[", "").Replace("]", "");
-                    // 写文件
-                    string prefix = "||||" + channel + "||||" + senderName + "||||";
-                    string tB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(translation));
-                    string ts = fields.Length >= 6 ? fields[5] : "";
-                    string logEntry = "{chatMsg = \"" + prefix + tB64 + "||||" + ts + "||||\"}";
-                    string pid = fields.Length >= 7 ? fields[6] : "";
-                    string outPath = Path.Combine((string)sync["CacheDir"], "chat_result_" + pid);
-                    WriteFileLocked(outPath, logEntry);
-
                     lock (sync.SyncRoot) { sync["AutoSent"] = (int)sync["AutoSent"] + 1; }
 
-                    // 写出结果给所有等待此消息的客户端
+                    // 统一由 FlushPendingKey → WriteCacheHit 写出结果给所有等待此消息的客户端
                     lock (sync.SyncRoot) { FlushPendingKey(sync, cacheKey); }
 
                     string disp = translation;
@@ -1497,4 +1488,5 @@ public static class CSharpWorkers
 '@ -ErrorAction SilentlyContinue
 
 mode con: cols=100 lines=30
+$host.UI.RawUI.BufferSize = New-Object Management.Automation.Host.Size(100, 9999)
 [CSharpWorkers]::Start()
