@@ -5,7 +5,7 @@ local settingsPage = require("AAFreeTranslation/settings_page")
 local AAFree_Translation_addon = {
 	name = "AAFreeTranslation",
 	author = "Canliaiex",
-	version = "1.0",
+	version = "1.0.7",
 	desc = "Need Run AAFREE Translation Service First"
 }
 
@@ -173,7 +173,7 @@ local function sendDecoratedChatByChannel(message, sender, channel)
 		X2Chat:DispatchChatMessage(58, prefix .. "[" .. sender .. "]: " .. message)
 	elseif tostring(channel) == "11" then
 		-- 审判 CMF_TRIAL
-		X2Chat:DispatchChatMessage(59, prefix .. "[" .. sender .. "]: " .. message)
+		X2Chat:DispatchChatMessage(56, "|cFFf9b126" .. prefix .. "[" .. sender .. "]: " .. message)
 	elseif tostring(channel) == "14" then
 		-- 势力 CMF_FACTION
 		X2Chat:DispatchChatMessage(56, "|cFFfcfc01" .. prefix .. "[" .. sender .. "]: " .. message)
@@ -182,7 +182,7 @@ local function sendDecoratedChatByChannel(message, sender, channel)
 		X2Chat:DispatchChatMessage(56, prefix .. message)
 	else
 		-- 未知频道，默认输出
-		X2Chat:DispatchChatMessage(56, "" .. prefix .. "[chid:" .. tostring(channel) .. "]:" .. message)
+		X2Chat:DispatchChatMessage(56, prefix .. "[Other" .. tostring(channel) .. "]:" .. message)
 	end
 end
 
