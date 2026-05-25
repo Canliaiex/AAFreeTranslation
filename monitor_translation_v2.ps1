@@ -39,9 +39,10 @@ $__asmNetHttp = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object
 # C# 子线程：文件监控 + 手动Worker + 自动Worker
 # ============================================================
 $dllPath = Join-Path $PSScriptRoot "MonitorTranslationLib.dll"
+$versionFile = Join-Path $PSScriptRoot "version"
 
-if (-not (Test-Path $dllPath)) {
-    Add-Type -ReferencedAssemblies $__asmWebEx,$__asmNetHttp,$trayFormsPath,$trayDrawingPath -TypeDefinition @'
+# C# 代码块
+$csharpCode = @'
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -1295,6 +1296,7 @@ public static class CSharpWorkers
                 if (!clipOpen) NativeWin32.GlobalFree(hMem);
             }
 
+
             const uint WM_ACTIVATE = 0x0006;
             const uint WM_KEYDOWN = 0x0100;
             const uint WM_KEYUP = 0x0101;
@@ -1488,7 +1490,21 @@ public static class CSharpWorkers
     }
 }
 
-'@ -OutputAssembly $dllPath -ErrorAction SilentlyContinue
+'@
+
+# 计算 C# 代码 MD5，与 version 文件对比，不一致则重新编译
+$md5 = [System.Security.Cryptography.MD5]::Create()
+try {
+    $currentHash = [System.BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($csharpCode))) -replace '-'
+} finally {
+    $md5.Dispose()
+}
+
+$lastHash = if (Test-Path $versionFile) { (Get-Content $versionFile -Raw).Trim() } else { "" }
+
+if ($currentHash -ne $lastHash) {
+    Add-Type -ReferencedAssemblies $__asmWebEx,$__asmNetHttp,$trayFormsPath,$trayDrawingPath -TypeDefinition $csharpCode -OutputAssembly $dllPath -ErrorAction SilentlyContinue
+    $currentHash | Set-Content $versionFile -NoNewline
 }
 
 Add-Type -Path $dllPath -ErrorAction SilentlyContinue
