@@ -38,7 +38,10 @@ $__asmNetHttp = [System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object
 # ============================================================
 # C# 子线程：文件监控 + 手动Worker + 自动Worker
 # ============================================================
-Add-Type -ReferencedAssemblies $__asmWebEx,$__asmNetHttp,$trayFormsPath,$trayDrawingPath -TypeDefinition @'
+$dllPath = Join-Path $PSScriptRoot "MonitorTranslationLib.dll"
+
+if (-not (Test-Path $dllPath)) {
+    Add-Type -ReferencedAssemblies $__asmWebEx,$__asmNetHttp,$trayFormsPath,$trayDrawingPath -TypeDefinition @'
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -1485,7 +1488,10 @@ public static class CSharpWorkers
     }
 }
 
-'@ -ErrorAction SilentlyContinue
+'@ -OutputAssembly $dllPath -ErrorAction SilentlyContinue
+}
+
+Add-Type -Path $dllPath -ErrorAction SilentlyContinue
 
 mode con: cols=100 lines=30
 $host.UI.RawUI.BufferSize = New-Object Management.Automation.Host.Size(100, 9999)
