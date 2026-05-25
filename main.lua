@@ -18,6 +18,8 @@ local GameUIScale = 0
 
 -- 玩家名（用于手动翻译分区）
 local playerName = ""
+-- 玩家角色名hash ID（OnLoad 初始化一次，运行期间不变）
+local playerHashID = ""
 
 -- 翻译方向: 0=待启动, 1=zh→en, 2=zh→ru, 3=ru→zh, 4=ru→en, 5=en→zh, 6=en→ru
 local translateType = 0
@@ -60,6 +62,27 @@ local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 -- ============================================================
 -- 工具函数
 -- ============================================================
+
+-- ============================================================
+-- 文本转hash值（DJB2 算法）
+-- ============================================================
+local function StringToID(str)
+    local hash = 5381
+    for i = 1, #str do
+        local c = string.byte(str, i)
+        hash = (hash * 33 + c) % 4294967296  -- 2^32
+    end
+    return hash
+end
+
+-- ============================================================
+-- 使用玩家角色名生成稳定的hash ID（不受游戏重启影响）
+-- ============================================================
+local function GetPlayerID()
+    local name = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
+    local num = StringToID(name)
+    return string.format("%.0f", num)
+end
 
 local function split(s, sep)
 	local fields = {}
@@ -125,8 +148,7 @@ local function writeChatToTranslatingFile(channel, unit, isHostile, name, messag
 		if tostring(channel) == "-4" then return end --屏蔽自己发送
 		local nPlayerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player")) --获取自身玩家名
 		if tostring(name):lower() == tostring(nPlayerName):lower():gsub("^%s*(.-)%s*$", "%1") then return end --屏蔽自己发送
-		local playerid = tonumber(api.Unit:GetUnitId("player"),16)--根据玩家id写入翻译请求文件
-		api.File:Write(chatSourceFile .. tostring(playerid), tostring( "||||" .. channel .. "||||" .. name .. "||||" .. base64Encode(message) .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||" .. tostring(playerid) .. "||||"))
+		api.File:Write(chatSourceFile .. playerHashID, tostring( "||||" .. channel .. "||||" .. name .. "||||" .. base64Encode(message) .. "||||"..settingsPage.GetLang() .. "||||" .. GetTimestamp() .. "||||" .. playerHashID .. "||||"))
 	end
 end
 
@@ -189,8 +211,7 @@ end
 -- 读取自动翻译结果
 local lastMsgTime = ""
 local function readLatestTranslatedMessage()
-	local playerid = tonumber(api.Unit:GetUnitId("player"),16)--根据玩家id读取翻译结果
-	local data = api.File:Read(chatResultFile .. tostring(playerid))
+	local data = api.File:Read(chatResultFile .. playerHashID)
 	if not data or not data.chatMsg then return end
 	local msg = data.chatMsg
 	local info = split(msg, "||||")
@@ -543,13 +564,13 @@ local function OnLoad()
 	trSettings = api.GetSettings("AAFreeTranslation")
 	if trSettings.isMinimized == nil then trSettings.isMinimized = false end
 	playerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
+	playerHashID = GetPlayerID()
 	CreateTranslatorUI()
 	CreateTranslationWindow()
 
 	-- 加载时清空上次的缓存数据
-	local pid = tostring(tonumber(api.Unit:GetUnitId("player"), 16))
-	api.File:Write(chatSourceFile .. pid, "")
-	api.File:Write(chatResultFile .. pid, "")
+	api.File:Write(chatSourceFile .. playerHashID, "")
+	api.File:Write(chatResultFile .. playerHashID, "")
 
 	api.On("UPDATE", OnUpdate)
 	settingsPage.Initialize()
