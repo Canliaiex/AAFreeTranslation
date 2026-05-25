@@ -286,7 +286,11 @@ local function CreateTranslatorUI()
 
 	trMainWindow = api.Interface:CreateEmptyWindow("tr_translatorMainWindow", "UIParent")
 	trMainWindow:Show(false)
-	trMainWindow:SetExtent(300, 90)--设置窗口大小
+	if trSettings.isMinimized then
+		trMainWindow:SetExtent(35, 35)
+	else
+		trMainWindow:SetExtent(300, 90)
+	end
 	trMainWindow:AddAnchor("TOPLEFT", "UIParent", trSettings.MainWindowx, trSettings.MainWindowy)
 	-- 编辑框纹理做背景，染蓝色
 	local trBg = trMainWindow:CreateNinePartDrawable(TEXTURE_PATH.MONEY_WINDOW, "background")
@@ -372,20 +376,19 @@ local function CreateTranslatorUI()
 	btn2Bg:AddAnchor("TOPLEFT", btn2, 0, 0)
 	btn2Bg:AddAnchor("BOTTOMRIGHT", btn2, 0, 0)
 	btn2:SetHandler("OnClick", function()
-		local width = trMainWindow:GetWidth()
-		if trMainWindow:GetWidth() >35 then
+		trSettings.isMinimized = not trSettings.isMinimized
+		if trSettings.isMinimized then
 			trLangBtn:Show(false)
 			trInputEdit:Show(false)
 			trOutputEdit:Show(false)
 			trMainWindow:SetExtent(35, 35)
 		else
-
 			trLangBtn:Show(true)
 			trInputEdit:Show(true)
 			trOutputEdit:Show(true)
 			trMainWindow:SetExtent(300, 90)
 		end
-
+		api.SaveSettings()
 	end)
 
 
@@ -418,6 +421,11 @@ local function CreateTranslatorUI()
 			end
 		end
 	end)
+	if trSettings.isMinimized then
+		trLangBtn:Show(false)
+		trInputEdit:Show(false)
+		trOutputEdit:Show(false)
+	end
 	trMainWindow:EnableDrag(true)
 end
 -- 手动翻译：创建聊天窗口监听
@@ -533,6 +541,7 @@ end
 -- ============================================================
 local function OnLoad()
 	trSettings = api.GetSettings("AAFreeTranslation")
+	if trSettings.isMinimized == nil then trSettings.isMinimized = false end
 	playerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
 	CreateTranslatorUI()
 	CreateTranslationWindow()
