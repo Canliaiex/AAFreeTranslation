@@ -5,7 +5,7 @@ local settingsPage = require("AAFreeTranslation/settings_page")
 local AAFree_Translation_addon = {
 	name = "AAFreeTranslation",
 	author = "Canliaiex",
-	version = "1.0.7",
+	version = "1.0.8",
 	desc = "Need Run AAFREE Translation Service First"
 }
 
